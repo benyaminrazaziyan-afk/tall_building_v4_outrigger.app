@@ -1654,10 +1654,6 @@ st.title("Tall Building Preliminary Design + Outrigger Belt Truss (v4.0)")
 st.caption(f"Prepared by {AUTHOR_NAME} | {APP_VERSION}")
 st.info("""
 **Key Updates in v4.0:**
-- Realistic wall cracked factor (0.40) for 60-story buildings
-- Outrigger belt truss system with configurable locations
-- Exact story ranges displayed for each zone
-- Improved stiffness calculation for tall buildings
 """)
 
 if "result" not in st.session_state:
