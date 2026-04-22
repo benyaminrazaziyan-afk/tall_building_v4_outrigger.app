@@ -1203,7 +1203,7 @@ def build_report(result: DesignResult) -> str:
     lines.append("-" * 74)
     for m in result.messages:
         lines.append(f"- {m}")
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 
 def _draw_rect(ax, x, y, w, h, color, fill=True, alpha=1.0, lw=1.0, ls="-", ec=None):
@@ -1282,7 +1282,7 @@ def plot_plan(inp: BuildingInput, result: DesignResult, zone_name: str):
             # Vertical outrigger arms
             _draw_rect(ax, or_x - 0.3, cy1, 0.6, or_y - cy1, OUTRIGGER_COLOR, fill=True, alpha=0.7)
             _draw_rect(ax, or_x - 0.3, cy0 - (or_y - cy0), 0.6, or_y - cy0, OUTRIGGER_COLOR, fill=True, alpha=0.7)
-            ax.text(or_x + 2, or_y + 2, f"OUTRIGGER\\nStory {or_result.story_level}", 
+            ax.text(or_x + 2, or_y + 2, f"OUTRIGGER\nStory {or_result.story_level}", 
                    fontsize=8, color=OUTRIGGER_COLOR, fontweight="bold")
 
     ax.annotate("", xy=(0, -4), xytext=(inp.plan_x, -4), arrowprops=dict(arrowstyle="<->", lw=1.2))
@@ -1364,13 +1364,13 @@ def plot_mode_shapes(result: DesignResult):
             for or_result in result.outrigger_results:
                 ax.axhline(y=or_result.height_m, color=OUTRIGGER_COLOR, linestyle=':', alpha=0.5, linewidth=1)
         
-        ax.set_title(f"Mode {m+1}\\nT = {mr.periods_s[m]:.3f} s", fontsize=11, fontweight="bold")
+        ax.set_title(f"Mode {m+1}\nT = {mr.periods_s[m]:.3f} s", fontsize=11, fontweight="bold")
         ax.set_xlim(-1.1, 1.1)
         ax.set_ylim(0.0, H)
         if m == 0:
             ax.set_ylabel("Height (m)")
             ax.set_yticks([0.0, H])
-            ax.set_yticklabels([f"Base\\n0.0", f"Roof\\n{H:.1f}"])
+            ax.set_yticklabels([f"Base\n0.0", f"Roof\n{H:.1f}"])
         else:
             ax.set_yticks([])
         ax.set_xticks([])
@@ -1446,7 +1446,7 @@ def plot_outrigger_efficiency(result: DesignResult):
     
     bars = ax1.bar(range(len(levels)), stiffnesses, color=OUTRIGGER_COLOR, alpha=0.7)
     ax1.set_xticks(range(len(levels)))
-    ax1.set_xticklabels([f"Story {l}\\n({h:.0f}m)" for l, h in zip(levels, heights)])
+    ax1.set_xticklabels([f"Story {l}\n({h:.0f}m)" for l, h in zip(levels, heights)])
     ax1.set_ylabel('Stiffness Contribution (MN/m)')
     ax1.set_title('Outrigger Stiffness Contribution')
     ax1.grid(True, alpha=0.3, axis='y')
