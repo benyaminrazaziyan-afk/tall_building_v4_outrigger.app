@@ -13,7 +13,7 @@ import streamlit as st
 G = 9.81
 STEEL_DENSITY = 7850.0
 APP_TITLE = "Tall Building Preliminary Design + Outrigger Belt Truss"
-APP_VERSION = "v6.0-engineering-fix"
+APP_VERSION = "v6.2-checked"
 
 
 # ----------------------------- DATA MODELS -----------------------------
@@ -216,6 +216,15 @@ class BuildingInput:
     slab_rebar_ratio: float = 0.0035
 
     seismic_mass_factor: float = 1.0
+    seismic_zone_factor: float = 1.0
+    importance_factor: float = 1.0
+    behavior_factor: float = 4.0
+    spectral_accel_short: float = 1.00
+    spectral_accel_1s: float = 0.40
+    outrigger_core_relief_max: float = 0.18
+    outrigger_column_relief_max: float = 0.22
+    outrigger_zone_wall_boost: float = 0.06
+    outrigger_zone_column_boost: float = 0.08
     Ct: float = 0.0488
     x_period: float = 0.75
     upper_period_factor: float = 1.20
@@ -254,8 +263,20 @@ def code_type_period(H: float, Ct: float, x_period: float) -> float:
     return Ct * (H ** x_period)
 
 
+def effective_lateral_force_coeff(inp: BuildingInput) -> float:
+    spectral_factor = 0.6 + 0.25 * inp.spectral_accel_short + 0.15 * inp.spectral_accel_1s
+    coeff = (
+        inp.prelim_lateral_force_coeff
+        * inp.seismic_zone_factor
+        * inp.importance_factor
+        * spectral_factor
+        / max(inp.behavior_factor, 1e-6)
+    )
+    return max(0.001, coeff)
+
+
 def preliminary_lateral_force_N(inp: BuildingInput, W_total_kN: float) -> float:
-    return inp.prelim_lateral_force_coeff * W_total_kN * 1000.0
+    return effective_lateral_force_coeff(inp) * W_total_kN * 1000.0
 
 
 def define_three_zones(n_story: int) -> List[ZoneDefinition]:
@@ -391,13 +412,21 @@ def beam_size_prelim(inp: BuildingInput, column_scale: float) -> tuple[float, fl
     return width, depth
 
 
-def directional_dims(base_dim: float, plan_x: float, plan_y: float) -> tuple[float, float]:
+def directional_dims(base_dim: float, plan_x: float, plan_y: float, min_dim: Optional[float] = None, max_dim: Optional[float] = None) -> tuple[float, float]:
     aspect = max(plan_x, plan_y) / max(min(plan_x, plan_y), 1e-9)
     if aspect <= 1.10:
-        return base_dim, base_dim
-    major = base_dim * 1.15
-    minor = base_dim * 0.90
-    return (major, minor) if plan_x >= plan_y else (minor, major)
+        dx, dy = base_dim, base_dim
+    else:
+        major = base_dim * 1.15
+        minor = base_dim * 0.90
+        dx, dy = (major, minor) if plan_x >= plan_y else (minor, major)
+    if min_dim is not None:
+        dx = max(min_dim, dx)
+        dy = max(min_dim, dy)
+    if max_dim is not None:
+        dx = min(max_dim, dx)
+        dy = min(max_dim, dy)
+    return dx, dy
 
 
 def calculate_outrigger_stiffness(
@@ -469,6 +498,24 @@ def calculate_total_outrigger_stiffness(inp: BuildingInput) -> tuple[List[Outrig
     return outriggers, total_k
 
 
+def outrigger_story_density(inp: BuildingInput) -> float:
+    if inp.n_story <= 0 or inp.outrigger_count <= 0:
+        return 0.0
+    valid = [lvl for lvl in inp.outrigger_story_levels[:inp.outrigger_count] if 1 <= lvl <= inp.n_story]
+    return min(1.0, len(valid) / max(inp.n_story / 15.0, 1.0))
+
+
+def zone_outrigger_count(inp: BuildingInput, zone: ZoneDefinition) -> int:
+    return sum(1 for lvl in inp.outrigger_story_levels[:inp.outrigger_count] if zone.story_start <= lvl <= zone.story_end)
+
+
+def outrigger_relief_factors(inp: BuildingInput) -> tuple[float, float]:
+    density = outrigger_story_density(inp)
+    core_relief = inp.outrigger_core_relief_max * density
+    column_relief = inp.outrigger_column_relief_max * density
+    return core_relief, column_relief
+
+
 def build_zone_results(inp: BuildingInput, core_scale: float, column_scale: float, slab_t: float) -> tuple[List[ZoneCoreResult], List[ZoneColumnResult]]:
     h_total = total_height(inp)
     zones = define_three_zones(inp.n_story)
@@ -478,6 +525,7 @@ def build_zone_results(inp: BuildingInput, core_scale: float, column_scale: floa
     zone_cores: List[ZoneCoreResult] = []
     zone_cols: List[ZoneColumnResult] = []
 
+    core_relief, column_relief = outrigger_relief_factors(inp)
     q = inp.DL + inp.LL + inp.slab_finish_allowance + slab_t * 25.0
     sigma_allow = 0.35 * inp.fck * 1000.0
 
@@ -496,13 +544,15 @@ def build_zone_results(inp: BuildingInput, core_scale: float, column_scale: floa
             r2_sum += (x - plan_center_x) ** 2 + (y - plan_center_y) ** 2
 
     w_total_est = q * floor_area(inp) * (inp.n_story + 0.7 * inp.n_basement)
-    base_shear_est = inp.prelim_lateral_force_coeff * w_total_est
+    base_shear_est = effective_lateral_force_coeff(inp) * w_total_est
     overturning_est = base_shear_est * 0.67 * h_total
 
     for zone in zones:
         wall_count = active_wall_count_by_zone(inp, zone.name)
         lengths = wall_lengths_for_layout(outer_x, outer_y, wall_count)
-        t = wall_thickness_by_zone(inp, h_total, zone, core_scale)
+        n_outriggers_in_zone = zone_outrigger_count(inp, zone)
+        zone_core_scale = core_scale * (1.0 - core_relief) * (1.0 + inp.outrigger_zone_wall_boost * n_outriggers_in_zone)
+        t = wall_thickness_by_zone(inp, h_total, zone, zone_core_scale)
         i_gross = core_equivalent_inertia(outer_x, outer_y, lengths, t, wall_count)
 
         cracked_factor = inp.wall_cracked_factor
@@ -549,13 +599,14 @@ def build_zone_results(inp: BuildingInput, core_scale: float, column_scale: floa
         p_perimeter = p_perimeter_gravity + abs(delta_p_perimeter)
         p_interior = p_interior_gravity + 0.05 * abs(delta_p_perimeter)
 
-        interior_dim = min(inp.max_column_dim, max(inp.min_column_dim, sqrt(max(p_interior, 1e-9) / sigma_allow))) * column_scale
-        perimeter_dim = min(inp.max_column_dim, max(inp.min_column_dim, sqrt(max(p_perimeter, 1e-9) / sigma_allow))) * max(inp.perimeter_column_factor, column_scale)
-        corner_dim = min(inp.max_column_dim, max(inp.min_column_dim, sqrt(max(p_corner, 1e-9) / sigma_allow))) * max(inp.corner_column_factor, column_scale)
+        zone_column_scale = column_scale * (1.0 - column_relief) * (1.0 + inp.outrigger_zone_column_boost * n_outriggers_in_zone)
+        interior_dim = min(inp.max_column_dim, max(inp.min_column_dim, sqrt(max(p_interior, 1e-9) / sigma_allow))) * zone_column_scale
+        perimeter_dim = min(inp.max_column_dim, max(inp.min_column_dim, sqrt(max(p_perimeter, 1e-9) / sigma_allow))) * max(inp.perimeter_column_factor, zone_column_scale)
+        corner_dim = min(inp.max_column_dim, max(inp.min_column_dim, sqrt(max(p_corner, 1e-9) / sigma_allow))) * max(inp.corner_column_factor, zone_column_scale)
 
-        interior_x, interior_y = directional_dims(interior_dim, inp.plan_x, inp.plan_y)
-        perimeter_x, perimeter_y = directional_dims(perimeter_dim, inp.plan_x, inp.plan_y)
-        corner_x, corner_y = directional_dims(corner_dim, inp.plan_x, inp.plan_y)
+        interior_x, interior_y = directional_dims(interior_dim, inp.plan_x, inp.plan_y, inp.min_column_dim, inp.max_column_dim)
+        perimeter_x, perimeter_y = directional_dims(perimeter_dim, inp.plan_x, inp.plan_y, inp.min_column_dim, inp.max_column_dim)
+        corner_x, corner_y = directional_dims(corner_dim, inp.plan_x, inp.plan_y, inp.min_column_dim, inp.max_column_dim)
 
         a_corner = corner_x * corner_y
         a_perim = perimeter_x * perimeter_y
@@ -1098,8 +1149,11 @@ def run_iterative_design(inp: BuildingInput) -> DesignResult:
     ]
 
     if ev["outriggers"]:
+        core_relief, column_relief = outrigger_relief_factors(inp)
         messages.append(f"Outrigger count = {len(ev['outriggers'])}")
         messages.append(f"Nominal outrigger stiffness contribution = {ev['K_outrigger']:.2e} N/m")
+        messages.append(f"Core demand relief used = {100.0 * core_relief:.1f}%")
+        messages.append(f"Column demand relief used = {100.0 * column_relief:.1f}%")
 
     return DesignResult(
         H_m=total_height(inp),
@@ -1444,10 +1498,24 @@ def streamlit_input_panel() -> BuildingInput:
     dl = float(st.sidebar.number_input("DL (kN/m²)", min_value=0.0, max_value=20.0, value=3.0))
     ll = float(st.sidebar.number_input("LL (kN/m²)", min_value=0.0, max_value=20.0, value=2.5))
     slab_finish_allowance = float(st.sidebar.number_input("Slab/fit-out allowance (kN/m²)", min_value=0.0, max_value=10.0, value=1.5))
+
+    st.sidebar.subheader("Cracked section / serviceability")
     wall_cracked_factor = float(st.sidebar.number_input("Wall cracked factor", min_value=0.10, max_value=1.00, value=0.40))
     column_cracked_factor = float(st.sidebar.number_input("Column cracked factor", min_value=0.10, max_value=1.00, value=0.70))
-    prelim_lateral_force_coeff = float(st.sidebar.number_input("Preliminary lateral force coeff.", min_value=0.001, max_value=0.200, value=0.015, format="%.3f"))
     drift_limit_ratio = float(st.sidebar.number_input("Allowable drift ratio", min_value=0.0005, max_value=0.0200, value=1 / 500, format="%.4f"))
+
+    st.sidebar.subheader("Seismic input")
+    prelim_lateral_force_coeff = float(st.sidebar.number_input("Base lateral coefficient", min_value=0.001, max_value=0.300, value=0.015, format="%.3f"))
+    seismic_zone_factor = float(st.sidebar.number_input("Seismic zone factor", min_value=0.20, max_value=3.00, value=1.00, format="%.2f"))
+    importance_factor = float(st.sidebar.number_input("Importance factor I", min_value=0.50, max_value=2.00, value=1.00, format="%.2f"))
+    behavior_factor = float(st.sidebar.number_input("Behavior / reduction factor R", min_value=1.00, max_value=10.00, value=4.00, format="%.2f"))
+    spectral_accel_short = float(st.sidebar.number_input("Short-period spectral accel SDS", min_value=0.10, max_value=3.00, value=1.00, format="%.2f"))
+    spectral_accel_1s = float(st.sidebar.number_input("1-sec spectral accel SD1", min_value=0.05, max_value=2.00, value=0.40, format="%.2f"))
+    seismic_mass_factor = float(st.sidebar.number_input("Seismic mass factor", min_value=0.50, max_value=1.50, value=1.00, format="%.2f"))
+    ct = float(st.sidebar.number_input("Ct", min_value=0.0050, max_value=0.2000, value=0.0488, format="%.4f"))
+    x_period = float(st.sidebar.number_input("x exponent", min_value=0.50, max_value=1.20, value=0.75, format="%.2f"))
+    upper_period_factor = float(st.sidebar.number_input("Upper period factor", min_value=1.00, max_value=2.00, value=1.20, format="%.2f"))
+    target_position_factor = float(st.sidebar.number_input("Target position factor β", min_value=0.00, max_value=1.00, value=0.85, format="%.2f"))
 
     st.sidebar.subheader("Outriggers")
     outrigger_count = int(st.sidebar.selectbox("Number of outriggers", [0, 1, 2, 3], index=2))
@@ -1473,6 +1541,10 @@ def streamlit_input_panel() -> BuildingInput:
     outrigger_truss_depth_m = float(st.sidebar.number_input("Outrigger truss depth (m)", min_value=0.5, max_value=10.0, value=3.0))
     outrigger_chord_area_m2 = float(st.sidebar.number_input("Chord area (m²)", min_value=0.001, max_value=1.0, value=0.08, format="%.3f"))
     outrigger_diagonal_area_m2 = float(st.sidebar.number_input("Diagonal area (m²)", min_value=0.001, max_value=1.0, value=0.04, format="%.3f"))
+    outrigger_core_relief_max = float(st.sidebar.number_input("Max core relief from outriggers", min_value=0.00, max_value=0.50, value=0.18, format="%.2f"))
+    outrigger_column_relief_max = float(st.sidebar.number_input("Max column relief from outriggers", min_value=0.00, max_value=0.50, value=0.22, format="%.2f"))
+    outrigger_zone_wall_boost = float(st.sidebar.number_input("Local wall demand boost at outrigger zones", min_value=0.00, max_value=0.30, value=0.06, format="%.2f"))
+    outrigger_zone_column_boost = float(st.sidebar.number_input("Local column demand boost at outrigger zones", min_value=0.00, max_value=0.30, value=0.08, format="%.2f"))
 
     return BuildingInput(
         plan_shape=plan_shape,
@@ -1501,11 +1573,25 @@ def streamlit_input_panel() -> BuildingInput:
         column_cracked_factor=column_cracked_factor,
         prelim_lateral_force_coeff=prelim_lateral_force_coeff,
         drift_limit_ratio=drift_limit_ratio,
+        seismic_zone_factor=seismic_zone_factor,
+        importance_factor=importance_factor,
+        behavior_factor=behavior_factor,
+        spectral_accel_short=spectral_accel_short,
+        spectral_accel_1s=spectral_accel_1s,
+        seismic_mass_factor=seismic_mass_factor,
+        Ct=ct,
+        x_period=x_period,
+        upper_period_factor=upper_period_factor,
+        target_position_factor=target_position_factor,
         outrigger_count=outrigger_count,
         outrigger_story_levels=levels,
         outrigger_truss_depth_m=outrigger_truss_depth_m,
         outrigger_chord_area_m2=outrigger_chord_area_m2,
         outrigger_diagonal_area_m2=outrigger_diagonal_area_m2,
+        outrigger_core_relief_max=outrigger_core_relief_max,
+        outrigger_column_relief_max=outrigger_column_relief_max,
+        outrigger_zone_wall_boost=outrigger_zone_wall_boost,
+        outrigger_zone_column_boost=outrigger_zone_column_boost,
     )
 
 
@@ -1516,7 +1602,7 @@ def main() -> None:
     st.caption(APP_VERSION)
     st.info(
         "Engineering fixes applied: corrected story stiffness trend, removed outrigger double counting, "
-        "added static drift solution from K·u=F, improved column sizing logic, and added elevation output."
+        "added static drift solution from K·u=F, and exposed cracked-section, seismic, and outrigger-sizing inputs."
     )
 
     if "result" not in st.session_state:
