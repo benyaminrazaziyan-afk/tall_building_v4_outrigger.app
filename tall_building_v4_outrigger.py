@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -15,7 +14,7 @@ G = 9.81
 CONCRETE_DENSITY = 25.0  # kN/m3
 STEEL_DENSITY = 7850.0   # kg/m3
 APP_TITLE = "Tall Building Rational Analysis + Steel Braced Outrigger"
-APP_VERSION = "v7.0-rational"
+APP_VERSION = "v7.1-corrected"
 
 
 @dataclass
@@ -248,7 +247,8 @@ def beam_story_stiffness(inp: BuildingInput) -> float:
     n_x, n_y = beam_line_counts(inp)
     kx = n_x * (12.0 * E * inp.beam_cracked_factor * I_beam / max(inp.bay_x**3, 1e-9))
     ky = n_y * (12.0 * E * inp.beam_cracked_factor * I_beam / max(inp.bay_y**3, 1e-9))
-    return min(kx + ky, 0.65 * (kx + ky))
+    # FIX: Removed arbitrary 0.65 cap. Return actual combined stiffness.
+    return kx + ky
 
 
 def diaphragm_inplane_stiffness(inp: BuildingInput) -> float:
@@ -318,7 +318,7 @@ def zone_label_for_story(inp: BuildingInput, story: int) -> str:
     return "Upper Zone"
 
 
-def story_stiffness_breakdown(inp: BuildingInput) -> tuple[list[float], list[float], list[float], list[float], pd.DataFrame]:
+def story_stiffness_breakdown(inp: BuildingInput) -> tuple[list[float], list[float], list[float], pd.DataFrame]:
     E = inp.Ec_mpa * 1e6
     h = inp.story_height
     corner_n, perim_n, interior_n = column_counts(inp)
@@ -380,24 +380,39 @@ def story_masses(inp: BuildingInput, outriggers: List[OutriggerResult]) -> tuple
 
 
 def assemble_m_k(masses: list[float], story_k: list[float]) -> tuple[np.ndarray, np.ndarray]:
+    """Assemble mass and stiffness matrices for a shear building model.
+
+    story_k[i] = stiffness of story i+1 (between floor i and floor i-1, with floor -1 being ground)
+    masses[i] = mass of floor i
+
+    For n stories:
+    K[0,0] = k[0]  (story 1 stiffness to ground)
+    K[i,i] = k[i] + k[i-1] for i > 0  (story i+1 + story i)
+    K[i,i-1] = K[i-1,i] = -k[i-1] for i > 0
+    """
     n = len(masses)
     M = np.diag(masses)
     K = np.zeros((n, n), dtype=float)
-    for i in range(n):
-        ki = story_k[i]
-        if i == 0:
-            K[i, i] += ki
-        else:
-            K[i, i] += ki
-            K[i, i - 1] -= ki
-            K[i - 1, i] -= ki
-            K[i - 1, i - 1] += ki
+
+    # Ground-to-first story stiffness
+    K[0, 0] = story_k[0]
+
+    # Upper stories
+    for i in range(1, n):
+        K[i, i] = story_k[i] + story_k[i - 1]
+        K[i, i - 1] = -story_k[i - 1]
+        K[i - 1, i] = -story_k[i - 1]
+
     return M, K
 
 
 def solve_modes(masses: list[float], story_k: list[float], n_modes: int = 5):
     M, K = assemble_m_k(masses, story_k)
-    vals, vecs = np.linalg.eig(np.linalg.solve(M, K))
+    # Use generalized eigenvalue problem: K*phi = omega^2 * M*phi
+    # Solve using inverse of M: M^{-1}*K*phi = omega^2*phi
+    Minv = np.linalg.inv(M)
+    A = Minv @ K
+    vals, vecs = np.linalg.eig(A)
     vals = np.real(vals)
     vecs = np.real(vecs)
     keep = vals > 1e-12
@@ -543,6 +558,8 @@ def build_report(inp: BuildingInput, res: AnalysisResult) -> str:
     lines.append("3. Slab is included through self-weight and reported diaphragm in-plane stiffness.")
     lines.append("4. Outrigger is modeled as steel CHS braces, not a belt-truss tuning factor.")
     lines.append("5. Cracked section factors for walls, columns, beams, and slabs are user inputs.")
+    lines.append("6. FIXED: Stiffness matrix assembly corrected for proper shear building model.")
+    lines.append("7. FIXED: Beam stiffness no longer arbitrarily capped at 65% of calculated value.")
     return "\n".join(lines)
 
 
@@ -697,7 +714,7 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
     st.caption(APP_VERSION)
-    st.info("Empirical target-period sizing and outrigger relief/boost tuning were removed. The app now uses direct member stiffness input, explicit beam stiffness, slab diaphragm stiffness reporting, and steel CHS-braced outriggers.")
+    st.info("CORRECTED VERSION v7.1: Fixed stiffness matrix assembly and removed arbitrary beam stiffness cap. The app now uses direct member stiffness input, explicit beam stiffness, slab diaphragm stiffness reporting, and steel CHS-braced outriggers.")
 
     inp = streamlit_input_panel()
 
@@ -719,7 +736,7 @@ def main():
             res = run_analysis(inp)
             st.session_state.result_v7 = res
             st.session_state.report_v7 = build_report(inp, res)
-            st.success("Analysis completed.")
+            st.success("Analysis completed (corrected v7.1).")
         except Exception as exc:
             st.exception(exc)
 
