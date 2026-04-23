@@ -1719,6 +1719,80 @@ def streamlit_input_panel() -> BuildingInput:
     )
 
 
+def plot_elevation(inp: BuildingInput, result: DesignResult):
+    """Simple elevation view with core and outrigger levels."""
+    fig, ax = plt.subplots(figsize=(8, 10))
+    H = total_height(inp)
+
+    ax.plot([0, inp.plan_x, inp.plan_x, 0, 0], [0, 0, H, H, 0], 'k-', linewidth=1.2)
+
+    core_w = 0.24 * inp.plan_x
+    core_x0 = 0.5 * (inp.plan_x - core_w)
+    ax.add_patch(plt.Rectangle((core_x0, 0), core_w, H, facecolor=CORE_COLOR, alpha=0.18, edgecolor=CORE_COLOR))
+
+    ax.plot([0.0, 0.0], [0, H], color=PERIM_COLOR, linestyle='--', linewidth=1.4)
+    ax.plot([inp.plan_x, inp.plan_x], [0, H], color=PERIM_COLOR, linestyle='--', linewidth=1.4)
+
+    for i in range(inp.n_story + 1):
+        y = i * inp.story_height
+        ax.plot([0, inp.plan_x], [y, y], color='gray', alpha=0.15, linewidth=0.6)
+
+    for o in getattr(result, 'outrigger_results', []):
+        y = o.height_m
+        ax.plot([core_x0, 0.0], [y, y], color=OUTRIGGER_COLOR, linewidth=2.6)
+        ax.plot([core_x0 + core_w, inp.plan_x], [y, y], color=OUTRIGGER_COLOR, linewidth=2.6)
+        ax.text(inp.plan_x + 0.6, y, f'St.{o.story_level}', va='center', fontsize=9, color=OUTRIGGER_COLOR)
+
+    ax.set_title('Elevation View with Outriggers')
+    ax.set_xlabel('Plan width direction')
+    ax.set_ylabel('Height (m)')
+    ax.set_xlim(-1.0, inp.plan_x + 6.0)
+    ax.set_ylim(0, H * 1.02)
+    ax.grid(True, alpha=0.25)
+    return fig
+
+
+def run_root_outrigger_study(inp: BuildingInput, candidate_levels: List[int], counts=(0, 1, 2, 3)) -> pd.DataFrame:
+    """Compare response for different counts of root outriggers while keeping other inputs fixed."""
+    rows = []
+    levels = sorted([int(x) for x in candidate_levels if 1 <= int(x) <= inp.n_story])
+    for count in counts:
+        test_inp = BuildingInput(**{**inp.__dict__})
+        chosen = levels[:max(0, min(int(count), len(levels)))]
+        test_inp.root_outrigger_story_levels = chosen
+        res = run_design(test_inp)
+        rows.append({
+            'root_outrigger_count': len(chosen),
+            'levels': ', '.join(str(x) for x in chosen) if chosen else '-',
+            'T1_s': res.estimated_period_s,
+            'top_drift_m': res.top_drift_m,
+            'K_total_N_per_m': res.K_estimated_N_per_m,
+            'core_scale': res.core_scale,
+            'column_scale': res.column_scale,
+        })
+    return pd.DataFrame(rows)
+
+
+def example_usage():
+    inp = BuildingInput(
+        plan_shape='rect',
+        n_story=60,
+        n_basement=3,
+        story_height=3.2,
+        basement_height=3.5,
+        plan_x=80.0,
+        plan_y=80.0,
+        n_bays_x=8,
+        n_bays_y=8,
+        bay_x=10.0,
+        bay_y=10.0,
+        root_outrigger_story_levels=[15, 30, 45],
+    )
+    res = run_design(inp)
+    study = run_root_outrigger_study(inp, [15, 30, 45], counts=(0, 1, 2, 3))
+    return inp, res, study
+
+
 # ----------------------------- LAYOUT -------------------------------
 
 
@@ -1925,3 +1999,4 @@ if __name__ == '__main__':
                     st.warning(f"**Governing Issue**: {res.governing_issue}")
                 else:
                     st.success("**Governing Issue**: All checks passed!")
+
