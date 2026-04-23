@@ -72,13 +72,6 @@ class RetainingWallInput:
         )
 
 
-@dataclass
-class BracedBayLayout:
-    top_x_bays: List[int] = field(default_factory=lambda: [2, 5])
-    bottom_x_bays: List[int] = field(default_factory=lambda: [2, 5])
-    left_y_bays: List[int] = field(default_factory=lambda: [2, 5])
-    right_y_bays: List[int] = field(default_factory=lambda: [2, 5])
-
 
 @dataclass
 class BuildingInput:
@@ -144,7 +137,55 @@ class BuildingInput:
     outrigger_depth_m: float = 3.0
     brace_effective_length_factor: float = 1.0
     brace_buckling_reduction: float = 0.85
-    braced_layout: BracedBayLayout = field(default_factory=BracedBayLayout)
+    target_period_s: float = 3.80
+
+
+def nearest_grid_index(value: float, spacing: float, max_bays: int) -> int:
+    idx = int(round(value / max(spacing, 1e-12)))
+    return max(0, min(max_bays, idx))
+
+
+def auto_brace_anchor_columns(inp: "BuildingInput") -> Dict[str, Tuple[float, float]]:
+    cx0 = 0.5 * (inp.plan_x_m - inp.core_outer_x_m)
+    cx1 = cx0 + inp.core_outer_x_m
+    cy0 = 0.5 * (inp.plan_y_m - inp.core_outer_y_m)
+    cy1 = cy0 + inp.core_outer_y_m
+    x_mid = 0.5 * inp.plan_x_m
+    y_mid = 0.5 * inp.plan_y_m
+    left_col_x = nearest_grid_index(cx0 / inp.bay_x_m, 1.0, inp.n_bays_x) * inp.bay_x_m
+    right_col_x = nearest_grid_index(cx1 / inp.bay_x_m, 1.0, inp.n_bays_x) * inp.bay_x_m
+    bottom_col_y = nearest_grid_index(cy0 / inp.bay_y_m, 1.0, inp.n_bays_y) * inp.bay_y_m
+    top_col_y = nearest_grid_index(cy1 / inp.bay_y_m, 1.0, inp.n_bays_y) * inp.bay_y_m
+    return {
+        "left": ((cx0, y_mid), (0.0, y_mid if inp.n_bays_y % 2 == 0 else nearest_grid_index(y_mid/inp.bay_y_m,1.0,inp.n_bays_y)*inp.bay_y_m)),
+        "right": ((cx1, y_mid), (inp.plan_x_m, y_mid if inp.n_bays_y % 2 == 0 else nearest_grid_index(y_mid/inp.bay_y_m,1.0,inp.n_bays_y)*inp.bay_y_m)),
+        "bottom": ((x_mid, cy0), (x_mid if inp.n_bays_x % 2 == 0 else nearest_grid_index(x_mid/inp.bay_x_m,1.0,inp.n_bays_x)*inp.bay_x_m, 0.0)),
+        "top": ((x_mid, cy1), (x_mid if inp.n_bays_x % 2 == 0 else nearest_grid_index(x_mid/inp.bay_x_m,1.0,inp.n_bays_x)*inp.bay_x_m, inp.plan_y_m)),
+    }
+
+
+def target_scale_factor(current: float, target: float, exponent: float, low: float, high: float) -> float:
+    if current <= 1e-9 or target <= 1e-9:
+        return 1.0
+    s = (current / target) ** exponent
+    return max(low, min(high, s))
+
+
+def scale_zone_member(z, wall_scale: float, frame_scale: float, slab_scale: float):
+    from dataclasses import replace
+    return replace(
+        z,
+        wall_thickness_m=max(0.20, min(1.50, z.wall_thickness_m * wall_scale)),
+        beam_width_m=max(0.25, min(1.20, z.beam_width_m * frame_scale)),
+        beam_depth_m=max(0.40, min(1.80, z.beam_depth_m * frame_scale)),
+        slab_thickness_m=max(0.16, min(0.45, z.slab_thickness_m * slab_scale)),
+        corner_col_x_m=max(0.35, min(2.00, z.corner_col_x_m * frame_scale)),
+        corner_col_y_m=max(0.35, min(2.00, z.corner_col_y_m * frame_scale)),
+        perimeter_col_x_m=max(0.35, min(2.00, z.perimeter_col_x_m * frame_scale)),
+        perimeter_col_y_m=max(0.35, min(2.00, z.perimeter_col_y_m * frame_scale)),
+        interior_col_x_m=max(0.30, min(2.00, z.interior_col_x_m * frame_scale)),
+        interior_col_y_m=max(0.30, min(2.00, z.interior_col_y_m * frame_scale)),
+    )
 
 
 @dataclass
@@ -602,7 +643,7 @@ def validate_input(inp: BuildingInput) -> Tuple[bool, str]:
     return True, "OK"
 
 
-def analyze(inp: BuildingInput) -> AnalysisResult:
+def analyze_once(inp: BuildingInput) -> AnalysisResult:
     ok, msg = validate_input(inp)
     if not ok:
         raise ValueError(msg)
@@ -626,7 +667,7 @@ def analyze(inp: BuildingInput) -> AnalysisResult:
         "Zone": zr.zone_name,
         "Stories": f"{zr.story_start}-{zr.story_end}",
         "Wall count": zr.wall_count,
-        "Wall t (m)": zr.wall_t_m,
+        "Core wall t (m)": zr.wall_t_m,
         "Perimeter wall t (m)": zr.perimeter_wall_t_m,
         "Beam b×h (m)": f"{zr.beam_b_m:.2f}×{zr.beam_h_m:.2f}",
         "Slab t (m)": zr.slab_t_m,
@@ -648,7 +689,8 @@ def analyze(inp: BuildingInput) -> AnalysisResult:
             "Story": i,
             "Elevation (m)": elevations[i - 1],
             "Zone": zr.zone_name,
-            "Wall t (m)": zr.wall_t_m,
+            "Core wall t (m)": zr.wall_t_m,
+            "Perimeter wall t (m)": zr.perimeter_wall_t_m,
             "Beam width (m)": zr.beam_b_m,
             "Beam depth (m)": zr.beam_h_m,
             "Slab t (m)": zr.slab_t_m,
@@ -660,7 +702,7 @@ def analyze(inp: BuildingInput) -> AnalysisResult:
             "Floor displacement (m)": disp[i - 1],
             "Story drift (m)": drifts[i - 1],
             "Story drift ratio": drift_ratios[i - 1],
-            "Outrigger": "Yes" if i in outr_map else "No",
+            "Braced story": "Yes" if i in outr_map else "No",
         })
     story_table = pd.DataFrame(story_rows)
 
@@ -678,11 +720,12 @@ def analyze(inp: BuildingInput) -> AnalysisResult:
     summary_table = pd.DataFrame({
         "Parameter": [
             "Total weight (kN)", "Base shear (kN)", "T1 from eigen analysis (s)",
+            "Design target period used for resizing only (s)",
             "Code period T_code = Ct.H^x (s)", "Upper period T_upper = Cu.T_code (s)",
             "Roof displacement (m)", "Max story drift (m)", "Max drift ratio"
         ],
         "Value": [
-            total_weight_kn, base_shear_kn, periods[0], T_code, T_upper,
+            total_weight_kn, base_shear_kn, periods[0], inp.target_period_s, T_code, T_upper,
             max(disp), max(drifts), max(drift_ratios)
         ]
     })
@@ -690,6 +733,41 @@ def analyze(inp: BuildingInput) -> AnalysisResult:
     return AnalysisResult(periods, freqs, shapes, stiffness, masses, disp, drifts, drift_ratios, elevations, lateral_forces,
                           zone_results, outr, summary_table, story_table, zone_table, outrigger_table,
                           total_weight_kn, total_mass_kg, base_shear_kn, T_code, T_upper, basement_report)
+
+
+def auto_resize_for_target(inp: BuildingInput, max_iter: int = 12):
+    from dataclasses import replace
+    work = replace(inp)
+    # deep-ish copy zone objects
+    work.lower_zone = replace(inp.lower_zone)
+    work.middle_zone = replace(inp.middle_zone)
+    work.upper_zone = replace(inp.upper_zone)
+    best = analyze_once(work)
+    best_err = abs(best.periods_s[0] - work.target_period_s)
+    for _ in range(max_iter):
+        res = analyze_once(work)
+        T1 = res.periods_s[0]
+        err = abs(T1 - work.target_period_s) / max(work.target_period_s, 1e-9)
+        if err < best_err:
+            best = res
+            best_err = err
+        if err < 0.04:
+            return work, res
+        wall_scale = target_scale_factor(T1, work.target_period_s, 0.30, 0.85, 1.18)
+        frame_scale = target_scale_factor(T1, work.target_period_s, 0.24, 0.87, 1.16)
+        slab_scale = target_scale_factor(T1, work.target_period_s, 0.08, 0.95, 1.05)
+        work.lower_zone = scale_zone_member(work.lower_zone, wall_scale, frame_scale, slab_scale)
+        work.middle_zone = scale_zone_member(work.middle_zone, wall_scale, frame_scale, slab_scale)
+        work.upper_zone = scale_zone_member(work.upper_zone, wall_scale, frame_scale, slab_scale)
+    return work, best
+
+
+def analyze(inp: BuildingInput) -> AnalysisResult:
+    sized_inp, result = auto_resize_for_target(inp)
+    inp.lower_zone = sized_inp.lower_zone
+    inp.middle_zone = sized_inp.middle_zone
+    inp.upper_zone = sized_inp.upper_zone
+    return analyze_once(inp)
 
 
 def plot_plan(inp: BuildingInput, result: AnalysisResult) -> plt.Figure:
@@ -725,30 +803,12 @@ def plot_plan(inp: BuildingInput, result: AnalysisResult) -> plt.Figure:
     for x, y, w, h in [(sx, inp.plan_y_m - t, p.top_length_m, t), (bx, 0, p.bottom_length_m, t), (0, ly, t, p.left_length_m), (inp.plan_x_m - t, ry, t, p.right_length_m)]:
         ax.add_patch(plt.Rectangle((x, y), w, h, fc='#8dd3c7', ec='#2c7f75', alpha=0.7))
 
-    # braces column-to-column in selected bays
+    # automatic brace lines from core to perimeter columns/walls
+    anchors = auto_brace_anchor_columns(inp)
     brace_color = '#d62728'
-    def draw_xbay(bay: int, y0: float, y1: float):
-        x0 = (bay - 1) * inp.bay_x_m
-        x1 = bay * inp.bay_x_m
-        ax.plot([x0, x1], [y0, y1], color=brace_color, lw=2.2)
-        ax.plot([x0, x1], [y1, y0], color=brace_color, lw=2.2)
-    def draw_ybay(bay: int, x0: float, x1: float):
-        y0 = (bay - 1) * inp.bay_y_m
-        y1 = bay * inp.bay_y_m
-        ax.plot([x0, x1], [y0, y1], color=brace_color, lw=2.2)
-        ax.plot([x0, x1], [y1, y0], color=brace_color, lw=2.2)
-    for bay in inp.braced_layout.top_x_bays:
-        if 1 <= bay <= inp.n_bays_x:
-            draw_xbay(bay, inp.plan_y_m - inp.bay_y_m, inp.plan_y_m)
-    for bay in inp.braced_layout.bottom_x_bays:
-        if 1 <= bay <= inp.n_bays_x:
-            draw_xbay(bay, 0, inp.bay_y_m)
-    for bay in inp.braced_layout.left_y_bays:
-        if 1 <= bay <= inp.n_bays_y:
-            draw_ybay(bay, 0, inp.bay_x_m)
-    for bay in inp.braced_layout.right_y_bays:
-        if 1 <= bay <= inp.n_bays_y:
-            draw_ybay(bay, inp.plan_x_m - inp.bay_x_m, inp.plan_x_m)
+    for _key, (p0, p1) in anchors.items():
+        ax.plot([p0[0], p1[0]], [p0[1], p1[1]], color=brace_color, lw=2.6)
+        ax.scatter([p1[0]], [p1[1]], color=brace_color, s=24, zorder=5)
 
     if inp.n_basement > 0 and inp.retaining_wall.enabled:
         ax.add_patch(plt.Rectangle((-0.5, -0.5), inp.plan_x_m + 1.0, inp.plan_y_m + 1.0, fill=False, ec='#6a3d9a', lw=2, ls=':'))
@@ -932,11 +992,7 @@ def streamlit_input_panel() -> BuildingInput:
     brace_effective_length_factor = float(st.sidebar.number_input('Brace K factor', 0.5, 2.0, d.brace_effective_length_factor, 0.05, format='%.2f'))
     brace_buckling_reduction = float(st.sidebar.number_input('Brace buckling reduction', 0.10, 1.00, d.brace_buckling_reduction, 0.05, format='%.2f'))
 
-    st.sidebar.markdown('### Braced bay layout (comma-separated bay numbers)')
-    top_x = parse_int_list(st.sidebar.text_input('Top side X bays', ','.join(map(str, d.braced_layout.top_x_bays))), n_bays_x)
-    bottom_x = parse_int_list(st.sidebar.text_input('Bottom side X bays', ','.join(map(str, d.braced_layout.bottom_x_bays))), n_bays_x)
-    left_y = parse_int_list(st.sidebar.text_input('Left side Y bays', ','.join(map(str, d.braced_layout.left_y_bays))), n_bays_y)
-    right_y = parse_int_list(st.sidebar.text_input('Right side Y bays', ','.join(map(str, d.braced_layout.right_y_bays))), n_bays_y)
+    target_period_s = float(st.sidebar.number_input('Target first-mode period for auto-sizing (s)', 0.50, 15.00, d.target_period_s, 0.10, format='%.2f'))
 
     return BuildingInput(
         n_story=n_story, n_basement=n_basement, story_height_m=story_height_m, basement_height_m=basement_height_m,
@@ -955,7 +1011,7 @@ def streamlit_input_panel() -> BuildingInput:
         brace_outer_diameter_mm=brace_outer_diameter_mm, brace_thickness_mm=brace_thickness_mm,
         braces_per_side=braces_per_side, outrigger_depth_m=outrigger_depth_m,
         brace_effective_length_factor=brace_effective_length_factor, brace_buckling_reduction=brace_buckling_reduction,
-        braced_layout=BracedBayLayout(top_x, bottom_x, left_y, right_y),
+        target_period_s=target_period_s,
     )
 
 
