@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import pi, sqrt
 from typing import List, Tuple, Optional
 
@@ -1196,6 +1196,76 @@ def run_design(inp: BuildingInput) -> DesignResult:
     return run_iterative_design(inp)
 
 
+def clone_input_without_outriggers(inp: BuildingInput) -> BuildingInput:
+    return replace(
+        inp,
+        outrigger_count=0,
+        outrigger_story_levels=[],
+    )
+
+
+def global_comparison_table(base_result: DesignResult, outrigger_result: DesignResult) -> pd.DataFrame:
+    rows = [
+        ("T_est (s)", base_result.estimated_period_s, outrigger_result.estimated_period_s),
+        ("Roof Drift (m)", base_result.top_drift_m, outrigger_result.top_drift_m),
+        ("Roof Drift Ratio", base_result.drift_ratio, outrigger_result.drift_ratio),
+        ("Max Story Drift Ratio", base_result.max_story_drift_ratio, outrigger_result.max_story_drift_ratio),
+        ("Effective Lateral Stiffness (N/m)", base_result.K_estimated_N_per_m, outrigger_result.K_estimated_N_per_m),
+        ("Weight (kN)", base_result.total_weight_kN, outrigger_result.total_weight_kN),
+        ("Core Scale", base_result.core_scale, outrigger_result.core_scale),
+        ("Column Scale", base_result.column_scale, outrigger_result.column_scale),
+    ]
+    data = []
+    for name, before, after in rows:
+        delta = after - before
+        pct = 100.0 * delta / abs(before) if abs(before) > 1e-12 else np.nan
+        data.append({
+            "Parameter": name,
+            "Without Outrigger": before,
+            "With Outrigger": after,
+            "Delta": delta,
+            "Delta %": pct,
+        })
+    return pd.DataFrame(data)
+
+
+def zone_comparison_table(base_result: DesignResult, outrigger_result: DesignResult) -> pd.DataFrame:
+    core_before = {z.zone.name: z for z in base_result.zone_core_results}
+    core_after = {z.zone.name: z for z in outrigger_result.zone_core_results}
+    col_before = {z.zone.name: z for z in base_result.zone_column_results}
+    col_after = {z.zone.name: z for z in outrigger_result.zone_column_results}
+
+    rows = []
+    for zone_name in ["Lower Zone", "Middle Zone", "Upper Zone"]:
+        cb = core_before[zone_name]
+        ca = core_after[zone_name]
+        pb = col_before[zone_name]
+        pa = col_after[zone_name]
+
+        def pct_change(a, b):
+            return 100.0 * (b - a) / abs(a) if abs(a) > 1e-12 else np.nan
+
+        rows.append({
+            "Zone": zone_name,
+            "Wall t before (m)": cb.wall_thickness,
+            "Wall t after (m)": ca.wall_thickness,
+            "Wall Δ %": pct_change(cb.wall_thickness, ca.wall_thickness),
+            "Core Ieff before (m4)": cb.Ieq_effective_m4,
+            "Core Ieff after (m4)": ca.Ieq_effective_m4,
+            "Core Ieff Δ %": pct_change(cb.Ieq_effective_m4, ca.Ieq_effective_m4),
+            "Corner col before (m)": max(pb.corner_column_x_m, pb.corner_column_y_m),
+            "Corner col after (m)": max(pa.corner_column_x_m, pa.corner_column_y_m),
+            "Corner Δ %": pct_change(max(pb.corner_column_x_m, pb.corner_column_y_m), max(pa.corner_column_x_m, pa.corner_column_y_m)),
+            "Perimeter col before (m)": max(pb.perimeter_column_x_m, pb.perimeter_column_y_m),
+            "Perimeter col after (m)": max(pa.perimeter_column_x_m, pa.perimeter_column_y_m),
+            "Perimeter Δ %": pct_change(max(pb.perimeter_column_x_m, pb.perimeter_column_y_m), max(pa.perimeter_column_x_m, pa.perimeter_column_y_m)),
+            "Interior col before (m)": max(pb.interior_column_x_m, pb.interior_column_y_m),
+            "Interior col after (m)": max(pa.interior_column_x_m, pa.interior_column_y_m),
+            "Interior Δ %": pct_change(max(pb.interior_column_x_m, pb.interior_column_y_m), max(pa.interior_column_x_m, pa.interior_column_y_m)),
+        })
+    return pd.DataFrame(rows)
+
+
 # ----------------------------- REPORTS / TABLES -----------------------------
 
 def build_report(result: DesignResult) -> str:
@@ -1609,6 +1679,8 @@ def main() -> None:
         st.session_state.result = None
     if "report" not in st.session_state:
         st.session_state.report = ""
+    if "baseline_result" not in st.session_state:
+        st.session_state.baseline_result = None
 
     inp = streamlit_input_panel()
 
@@ -1623,12 +1695,16 @@ def main() -> None:
     if clear_btn:
         st.session_state.result = None
         st.session_state.report = ""
+        st.session_state.baseline_result = None
         st.rerun()
 
     if analyze:
         try:
             with st.spinner("Running iterative MDOF analysis..."):
+                base_inp = clone_input_without_outriggers(inp)
+                base_res = run_design(base_inp)
                 res = run_design(inp)
+                st.session_state.baseline_result = base_res
                 st.session_state.result = res
                 st.session_state.report = build_report(res)
             st.success(f"Analysis completed in {len(res.iteration_history)} iterations.")
@@ -1638,7 +1714,10 @@ def main() -> None:
     if show_modes and st.session_state.result is None:
         try:
             with st.spinner("Running analysis first..."):
+                base_inp = clone_input_without_outriggers(inp)
+                base_res = run_design(base_inp)
                 res = run_design(inp)
+                st.session_state.baseline_result = base_res
                 st.session_state.result = res
                 st.session_state.report = build_report(res)
         except Exception as exc:
@@ -1649,8 +1728,10 @@ def main() -> None:
         st.warning("Enter data and click Analyze.")
         return
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "Summary", "Iteration", "Modes", "Plan", "Elevation", "Report"
+    baseline_result = st.session_state.baseline_result
+
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "Summary", "Comparison", "Iteration", "Modes", "Plan", "Elevation", "Report"
     ])
 
     with tab1:
@@ -1673,6 +1754,17 @@ def main() -> None:
                 st.write(f"- {item}")
 
     with tab2:
+        st.subheader("Before / after outrigger comparison")
+        if baseline_result is None:
+            st.info("Run analysis to generate the comparison table.")
+        else:
+            st.markdown("**Global comparison**")
+            st.dataframe(global_comparison_table(baseline_result, result), use_container_width=True)
+
+            st.markdown("**Zone-by-zone member comparison**")
+            st.dataframe(zone_comparison_table(baseline_result, result), use_container_width=True)
+
+    with tab3:
         st.subheader("Iteration history")
         df_iter = iteration_table(result)
         st.dataframe(df_iter, use_container_width=True)
@@ -1685,21 +1777,21 @@ def main() -> None:
             mime="text/csv",
         )
 
-    with tab3:
+    with tab4:
         st.subheader("Mode shapes")
         st.pyplot(plot_mode_shapes(result, modes=5))
 
-    with tab4:
+    with tab5:
         st.subheader("Plan view")
         zone_options = [z.zone.name for z in result.zone_core_results]
         zone_name = st.selectbox("Zone", zone_options, index=0)
         st.pyplot(plot_plan(result, inp, zone_name=zone_name))
 
-    with tab5:
+    with tab6:
         st.subheader("Elevation view")
         st.pyplot(plot_elevation(result, inp))
 
-    with tab6:
+    with tab7:
         st.subheader("Report")
         st.text_area("Text report", st.session_state.report, height=500)
         st.download_button(
