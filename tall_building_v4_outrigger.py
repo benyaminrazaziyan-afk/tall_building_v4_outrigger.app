@@ -1163,7 +1163,7 @@ def run_design(inp: BuildingInput) -> DesignResult:
 def build_report(result: DesignResult) -> str:
     lines = []
     lines.append("=" * 74)
-    lines.append("TALL BUILDING PRELIMINARY DESIGN REPORT - v4.0 (Outrigger)")
+    lines.append("UNIVERSITY-STYLE PRELIMINARY STRUCTURAL DESIGN REPORT - TALL BUILDING WITH OUTRIGGERS")
     lines.append("=" * 74)
     lines.append("")
     lines.append("GLOBAL RESPONSE")
@@ -1630,28 +1630,67 @@ def streamlit_input_panel() -> BuildingInput:
         slab_rebar_ratio = st.number_input("Slab rebar ratio", min_value=0.0, max_value=0.1, value=0.0035, format="%.4f")
         x_period = st.number_input("x exponent", min_value=0.1, max_value=1.5, value=0.75)
 
-    # [NEW] Outrigger section
+    # [NEW] Outrigger / Root-Outrigger section
     st.markdown("### Outrigger Belt Truss System")
-    st.info("For 60-story buildings, outriggers at stories 30 and 45 are recommended.")
-    
-    c7, c8 = st.columns(2)
+    st.info(
+        "Recommended preliminary levels for a 60-story tower are around mid-height and upper-third height. "
+        "Root outriggers may be used at lower mechanical levels when architecturally feasible."
+    )
+
+    c7, c8, c9 = st.columns(3)
     with c7:
         outrigger_count = st.number_input("Number of outriggers", min_value=0, max_value=5, value=0, step=1)
-        outrigger_truss_depth_m = st.number_input("Outrigger truss depth (m)", min_value=1.0, max_value=6.0, value=3.0)
+        root_outrigger_count = st.number_input("Number of root outriggers", min_value=0, max_value=5, value=0, step=1)
     with c8:
+        outrigger_axis = st.selectbox("Active axis", ["x", "y"], index=0)
+        outrigger_truss_depth_m = st.number_input("Outrigger truss depth (m)", min_value=1.0, max_value=8.0, value=3.0)
+    with c9:
         outrigger_chord_area_m2 = st.number_input("Outrigger chord area (m²)", min_value=0.01, max_value=0.5, value=0.08, format="%.4f")
         outrigger_diagonal_area_m2 = st.number_input("Outrigger diagonal area (m²)", min_value=0.01, max_value=0.5, value=0.04, format="%.4f")
-    
-    # [NEW] Outrigger story levels input
+
     outrigger_story_levels = []
     if outrigger_count > 0:
-        st.markdown("**Outrigger Locations (story numbers):**")
-        or_cols = st.columns(min(outrigger_count, 3))
+        st.markdown("**Outrigger locations (story numbers)**")
+        or_cols = st.columns(min(max(outrigger_count, 1), 3))
+        defaults = [
+            max(1, min(n_story, int(round(0.50 * n_story)))),
+            max(1, min(n_story, int(round(0.75 * n_story)))),
+            max(1, min(n_story, int(round(0.85 * n_story)))),
+        ]
         for i in range(outrigger_count):
-            with or_cols[i % 3]:
-                level = st.number_input(f"Outrigger {i+1} story", min_value=1, max_value=120, 
-                                       value=min(30 + i*15, n_story), step=1, key=f"or_{i}")
+            with or_cols[i % len(or_cols)]:
+                default_val = defaults[i] if i < len(defaults) else max(1, min(n_story, 10 + 10 * i))
+                level = st.number_input(
+                    f"Outrigger {i+1} story",
+                    min_value=1,
+                    max_value=int(n_story),
+                    value=int(default_val),
+                    step=1,
+                    key=f"or_{i}",
+                )
                 outrigger_story_levels.append(int(level))
+
+    root_outrigger_story_levels = []
+    if root_outrigger_count > 0:
+        st.markdown("**Root-outrigger locations (story numbers)**")
+        root_cols = st.columns(min(max(root_outrigger_count, 1), 3))
+        root_defaults = [
+            max(1, min(n_story, int(round(0.20 * n_story)))),
+            max(1, min(n_story, int(round(0.35 * n_story)))),
+            max(1, min(n_story, int(round(0.50 * n_story)))),
+        ]
+        for i in range(root_outrigger_count):
+            with root_cols[i % len(root_cols)]:
+                default_val = root_defaults[i] if i < len(root_defaults) else max(1, min(n_story, 5 + 10 * i))
+                level = st.number_input(
+                    f"Root outrigger {i+1} story",
+                    min_value=1,
+                    max_value=int(n_story),
+                    value=int(default_val),
+                    step=1,
+                    key=f"root_or_{i}",
+                )
+                root_outrigger_story_levels.append(int(level))
 
     return BuildingInput(
         plan_shape=plan_shape,
@@ -1808,7 +1847,7 @@ if __name__ == '__main__':
         unsafe_allow_html=True
     )
 
-    st.title("Tall Building Preliminary Design + Outrigger Belt Truss (v4.0)")
+    st.title("Tall Building Preliminary Structural Design with Outrigger and Root-Outrigger System")
     st.caption(f"Prepared by {AUTHOR_NAME} | {APP_VERSION}")
     st.info("""
     **Key Updates in v4.0:**
@@ -1999,4 +2038,3 @@ if __name__ == '__main__':
                     st.warning(f"**Governing Issue**: {res.governing_issue}")
                 else:
                     st.success("**Governing Issue**: All checks passed!")
-
