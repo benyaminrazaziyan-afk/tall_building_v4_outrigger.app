@@ -2,22 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from math import pi, sqrt
-from typing import List, Dict, Tuple, Optional
+from typing import Dict, List, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+import streamlit as st
 
-try:
-    import streamlit as st
-except Exception:  # allows offline validation without streamlit installed
-    st = None
-
-APP_TITLE = "Tall Building Rational Analysis + Auto Outrigger Layout"
-APP_VERSION = "v9.1-rebuilt"
 G = 9.81
 CONCRETE_UNIT_WEIGHT = 25.0  # kN/m3
-STEEL_DENSITY = 7850.0  # kg/m3
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 
 @dataclass
@@ -32,247 +29,131 @@ class ZoneDefinition:
 
 
 @dataclass
-class ZoneMemberInput:
-    wall_thickness_m: float
-    beam_width_m: float
-    beam_depth_m: float
-    slab_thickness_m: float
-    corner_col_x_m: float
-    corner_col_y_m: float
-    perimeter_col_x_m: float
-    perimeter_col_y_m: float
-    interior_col_x_m: float
-    interior_col_y_m: float
-    wall_count: int = 8
+class ZoneMembers:
+    wall_t: float
+    perimeter_wall_t: float
+    beam_b: float
+    beam_h: float
+    slab_t: float
+    corner_col_x: float
+    corner_col_y: float
+    perimeter_col_x: float
+    perimeter_col_y: float
+    interior_col_x: float
+    interior_col_y: float
 
 
 @dataclass
-class PerimeterWallInput:
-    thickness_m: float
-    top_length_m: float
-    bottom_length_m: float
-    left_length_m: float
-    right_length_m: float
-
-    def normalized(self, plan_x: float, plan_y: float) -> "PerimeterWallInput":
-        return PerimeterWallInput(
-            thickness_m=self.thickness_m,
-            top_length_m=min(max(self.top_length_m, 0.0), plan_x),
-            bottom_length_m=min(max(self.bottom_length_m, 0.0), plan_x),
-            left_length_m=min(max(self.left_length_m, 0.0), plan_y),
-            right_length_m=min(max(self.right_length_m, 0.0), plan_y),
-        )
-
-
-@dataclass
-class RetainingWallInput:
-    enabled: bool = True
-    thickness_m: float = 0.40
-    top_length_m: float = 0.0
-    bottom_length_m: float = 0.0
-    left_length_m: float = 0.0
-    right_length_m: float = 0.0
-    stiffness_reduction: float = 0.15
-
-    def normalized(self, plan_x: float, plan_y: float) -> "RetainingWallInput":
-        return RetainingWallInput(
-            enabled=self.enabled,
-            thickness_m=self.thickness_m,
-            top_length_m=plan_x if self.top_length_m <= 0 else min(self.top_length_m, plan_x),
-            bottom_length_m=plan_x if self.bottom_length_m <= 0 else min(self.bottom_length_m, plan_x),
-            left_length_m=plan_y if self.left_length_m <= 0 else min(self.left_length_m, plan_y),
-            right_length_m=plan_y if self.right_length_m <= 0 else min(self.right_length_m, plan_y),
-            stiffness_reduction=clamp(self.stiffness_reduction, 0.02, 0.30),
-        )
-
-
-@dataclass
-class BraceInput:
-    outer_diameter_mm: float = 355.6
-    thickness_mm: float = 16.0
+class BraceSystem:
+    n_outrigger_levels: int = 2
+    outer_diameter_mm: float = 406.4
+    thickness_mm: float = 18.0
     k_factor: float = 1.0
-    buckling_reduction: float = 0.80
+    buckling_reduction: float = 0.85
 
 
 @dataclass
 class BuildingInput:
     n_story: int = 60
     n_basement: int = 2
-    story_height_m: float = 3.2
-    basement_height_m: float = 3.2
-    plan_x_m: float = 48.0
-    plan_y_m: float = 42.0
+    story_h: float = 3.2
+    basement_h: float = 3.2
+    plan_x: float = 48.0
+    plan_y: float = 42.0
     n_bays_x: int = 6
     n_bays_y: int = 6
-    bay_x_m: float = 8.0
-    bay_y_m: float = 7.0
+    bay_x: float = 8.0
+    bay_y: float = 7.0
 
-    core_outer_x_m: float = 18.0
-    core_outer_y_m: float = 15.0
-    core_opening_x_m: float = 11.5
-    core_opening_y_m: float = 9.0
+    core_outer_x: float = 18.0
+    core_outer_y: float = 15.0
+    core_open_x: float = 11.5
+    core_open_y: float = 9.0
 
     Ec_mpa: float = 34000.0
     Es_mpa: float = 200000.0
 
-    wall_cracked_factor: float = 0.50
-    perimeter_wall_cracked_factor: float = 0.45
-    column_cracked_factor: float = 0.70
-    beam_cracked_factor: float = 0.35
+    wall_cr: float = 0.50
+    perimeter_wall_cr: float = 0.40
+    beam_cr: float = 0.35
+    col_cr: float = 0.70
+    slab_cr: float = 0.25
 
-    super_dead_load_kpa: float = 4.5
-    live_load_kpa: float = 2.0
-    facade_line_load_kn_m: float = 12.0
-    seismic_mass_factor: float = 1.0
-
-    lower_zone: ZoneMemberInput = field(default_factory=lambda: ZoneMemberInput(
-        wall_thickness_m=0.70,
-        beam_width_m=0.45,
-        beam_depth_m=0.90,
-        slab_thickness_m=0.24,
-        corner_col_x_m=1.20,
-        corner_col_y_m=1.20,
-        perimeter_col_x_m=1.00,
-        perimeter_col_y_m=1.00,
-        interior_col_x_m=0.90,
-        interior_col_y_m=0.90,
-        wall_count=8,
-    ))
-    middle_zone: ZoneMemberInput = field(default_factory=lambda: ZoneMemberInput(
-        wall_thickness_m=0.55,
-        beam_width_m=0.40,
-        beam_depth_m=0.80,
-        slab_thickness_m=0.22,
-        corner_col_x_m=1.00,
-        corner_col_y_m=1.00,
-        perimeter_col_x_m=0.85,
-        perimeter_col_y_m=0.85,
-        interior_col_x_m=0.75,
-        interior_col_y_m=0.75,
-        wall_count=6,
-    ))
-    upper_zone: ZoneMemberInput = field(default_factory=lambda: ZoneMemberInput(
-        wall_thickness_m=0.40,
-        beam_width_m=0.35,
-        beam_depth_m=0.70,
-        slab_thickness_m=0.20,
-        corner_col_x_m=0.80,
-        corner_col_y_m=0.80,
-        perimeter_col_x_m=0.70,
-        perimeter_col_y_m=0.70,
-        interior_col_x_m=0.60,
-        interior_col_y_m=0.60,
-        wall_count=4,
-    ))
-
-    lower_perimeter_wall: PerimeterWallInput = field(default_factory=lambda: PerimeterWallInput(0.35, 18.0, 18.0, 14.0, 14.0))
-    middle_perimeter_wall: PerimeterWallInput = field(default_factory=lambda: PerimeterWallInput(0.30, 14.0, 14.0, 10.0, 10.0))
-    upper_perimeter_wall: PerimeterWallInput = field(default_factory=lambda: PerimeterWallInput(0.25, 10.0, 10.0, 8.0, 8.0))
-
-    retaining_wall: RetainingWallInput = field(default_factory=RetainingWallInput)
-
-    outrigger_story_levels: List[int] = field(default_factory=lambda: [24, 42])
-    brace_input: BraceInput = field(default_factory=BraceInput)
-
-    drift_limit_ratio: float = 1 / 500
+    drift_limit: float = 1.0 / 500.0
     Ct: float = 0.0488
     x_exp: float = 0.75
     Cu: float = 1.4
-    auto_size: bool = True
+    seismic_coeff: float = 0.015
+
+    retaining_enabled: bool = True
+    retaining_t: float = 0.50
+    retaining_reduction: float = 0.08
+
+    brace: BraceSystem = field(default_factory=BraceSystem)
+
+    lower: ZoneMembers = field(default_factory=lambda: ZoneMembers(
+        wall_t=0.80, perimeter_wall_t=0.35, beam_b=0.60, beam_h=0.95, slab_t=0.24,
+        corner_col_x=1.20, corner_col_y=1.20,
+        perimeter_col_x=1.05, perimeter_col_y=1.05,
+        interior_col_x=0.90, interior_col_y=0.90,
+    ))
+    middle: ZoneMembers = field(default_factory=lambda: ZoneMembers(
+        wall_t=0.65, perimeter_wall_t=0.28, beam_b=0.55, beam_h=0.82, slab_t=0.22,
+        corner_col_x=1.00, corner_col_y=1.00,
+        perimeter_col_x=0.90, perimeter_col_y=0.90,
+        interior_col_x=0.78, interior_col_y=0.78,
+    ))
+    upper: ZoneMembers = field(default_factory=lambda: ZoneMembers(
+        wall_t=0.50, perimeter_wall_t=0.22, beam_b=0.45, beam_h=0.68, slab_t=0.20,
+        corner_col_x=0.82, corner_col_y=0.82,
+        perimeter_col_x=0.74, perimeter_col_y=0.74,
+        interior_col_x=0.65, interior_col_y=0.65,
+    ))
 
 
 @dataclass
-class StoryRow:
+class StoryState:
     story: int
     zone: str
-    brace_level: str
-    wall_t_m: float
-    perimeter_wall_t_m: float
-    beam_b_m: float
-    beam_h_m: float
-    slab_t_m: float
-    corner_col_m: str
-    perimeter_col_m: str
-    interior_col_m: str
-    story_stiffness_gn_m: float
-    story_mass_ton: float
-
-
-@dataclass
-class ZoneSummary:
-    zone: str
-    stories: str
-    core_wall_t_m: float
-    perimeter_wall_t_m: float
-    beam_b_m: float
-    beam_h_m: float
-    slab_t_m: float
+    brace_level: bool
+    wall_t: float
+    perimeter_wall_t: float
+    beam_b: float
+    beam_h: float
+    slab_t: float
     corner_col: str
     perimeter_col: str
     interior_col: str
-    core_wall_count: int
-
-
-@dataclass
-class BraceLine:
-    x0: float
-    y0: float
-    x1: float
-    y1: float
-    side: str
-    target_label: str
-
-
-@dataclass
-class OutriggerLevelResult:
-    story: int
-    elevation_m: float
-    brace_count: int
-    od_mm: float
-    t_mm: float
-    area_cm2: float
-    slenderness: float
-    k_eff_gn_m: float
-
-
-@dataclass
-class ModalResult:
-    periods_s: List[float]
-    frequencies_hz: List[float]
-    mode_shapes: List[np.ndarray]
-    effective_mass_ratios: List[float]
+    k_core: float
+    k_perimeter_walls: float
+    k_frame: float
+    k_outrigger: float
+    k_total: float
+    mass_t: float
 
 
 @dataclass
 class AnalysisResult:
-    inp: BuildingInput
-    zones: List[ZoneDefinition]
-    zone_summaries: List[ZoneSummary]
-    story_rows: List[StoryRow]
-    modal: ModalResult
+    periods: List[float]
     roof_disp_m: float
     max_story_drift_m: float
     max_story_drift_ratio: float
-    story_displacements_m: np.ndarray
-    story_drifts_m: np.ndarray
-    story_stiffness_n_m: np.ndarray
-    story_masses_kg: np.ndarray
-    outrigger_results: List[OutriggerLevelResult]
-    brace_lines_by_story: Dict[int, List[BraceLine]]
-    t_code_s: float
-    t_upper_s: float
-    total_weight_kn: float
-
-
-# ----------------------------- CORE LOGIC -----------------------------
-
-def clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
+    code_period: float
+    period_ceiling: float
+    brace_levels: List[int]
+    brace_zone_count: Dict[str, int]
+    story_table: pd.DataFrame
+    zone_table: pd.DataFrame
+    contribution_table: pd.DataFrame
+    iteration_log: pd.DataFrame
+    system_force_table: pd.DataFrame
+    brace_force_table: pd.DataFrame
+    resized_input: BuildingInput
 
 
 def define_zones(n_story: int) -> List[ZoneDefinition]:
-    z1 = max(1, int(round(0.30 * n_story)))
-    z2 = max(z1 + 1, int(round(0.70 * n_story)))
+    z1 = max(1, round(0.30 * n_story))
+    z2 = max(z1 + 1, round(0.70 * n_story))
     return [
         ZoneDefinition("Lower Zone", 1, z1),
         ZoneDefinition("Middle Zone", z1 + 1, z2),
@@ -280,340 +161,191 @@ def define_zones(n_story: int) -> List[ZoneDefinition]:
     ]
 
 
-def zone_for_story(zones: List[ZoneDefinition], story: int) -> ZoneDefinition:
-    for z in zones:
+def zone_for_story(inp: BuildingInput, story: int) -> Tuple[ZoneDefinition, ZoneMembers]:
+    for z in define_zones(inp.n_story):
         if z.story_start <= story <= z.story_end:
-            return z
-    raise ValueError(f"Story {story} out of range")
+            members = inp.lower if z.name == "Lower Zone" else inp.middle if z.name == "Middle Zone" else inp.upper
+            return z, members
+    raise ValueError("Story out of range")
 
 
-def zone_member(inp: BuildingInput, zone_name: str) -> ZoneMemberInput:
-    return {
-        "Lower Zone": inp.lower_zone,
-        "Middle Zone": inp.middle_zone,
-        "Upper Zone": inp.upper_zone,
-    }[zone_name]
+def auto_brace_levels(inp: BuildingInput) -> List[int]:
+    n = inp.brace.n_outrigger_levels
+    if n <= 0:
+        return []
+    ratios = [0.34, 0.62, 0.82][:n]
+    return sorted({max(2, min(inp.n_story - 1, round(inp.n_story * r))) for r in ratios})
 
 
-def zone_perimeter_wall(inp: BuildingInput, zone_name: str) -> PerimeterWallInput:
-    return {
-        "Lower Zone": inp.lower_perimeter_wall,
-        "Middle Zone": inp.middle_perimeter_wall,
-        "Upper Zone": inp.upper_perimeter_wall,
-    }[zone_name].normalized(inp.plan_x_m, inp.plan_y_m)
+def brace_zone_count(inp: BuildingInput, levels: List[int]) -> Dict[str, int]:
+    counts = {z.name: 0 for z in define_zones(inp.n_story)}
+    for lv in levels:
+        z, _ = zone_for_story(inp, lv)
+        counts[z.name] += 1
+    return counts
 
 
-def normalize_input(inp: BuildingInput) -> BuildingInput:
-    min_story_beam_max = 0.28 * inp.story_height_m
+def chs_area_mm2(d_mm: float, t_mm: float) -> float:
+    di = max(d_mm - 2.0 * t_mm, 0.0)
+    return 0.25 * pi * (d_mm**2 - di**2)
 
-    def norm_zone(z: ZoneMemberInput, band: str) -> ZoneMemberInput:
-        if band == "lower":
-            wall_min, col_min = 0.55, 0.95
-        elif band == "middle":
-            wall_min, col_min = 0.40, 0.75
-        else:
-            wall_min, col_min = 0.30, 0.55
-        beam_depth_min = max(0.55, 0.10 * max(inp.bay_x_m, inp.bay_y_m))
-        return replace(
-            z,
-            wall_thickness_m=clamp(z.wall_thickness_m, wall_min, 1.20),
-            beam_width_m=clamp(z.beam_width_m, 0.30, 0.70),
-            beam_depth_m=clamp(z.beam_depth_m, max(0.60, beam_depth_min), min(1.40, min_story_beam_max)),
-            slab_thickness_m=clamp(z.slab_thickness_m, 0.18, 0.35),
-            corner_col_x_m=clamp(z.corner_col_x_m, col_min, 1.80),
-            corner_col_y_m=clamp(z.corner_col_y_m, col_min, 1.80),
-            perimeter_col_x_m=clamp(z.perimeter_col_x_m, col_min - 0.10, 1.60),
-            perimeter_col_y_m=clamp(z.perimeter_col_y_m, col_min - 0.10, 1.60),
-            interior_col_x_m=clamp(z.interior_col_x_m, col_min - 0.20, 1.40),
-            interior_col_y_m=clamp(z.interior_col_y_m, col_min - 0.20, 1.40),
-            wall_count=4 if z.wall_count <= 4 else (6 if z.wall_count <= 6 else 8),
-        )
 
-    return replace(
-        inp,
-        lower_zone=norm_zone(inp.lower_zone, "lower"),
-        middle_zone=norm_zone(inp.middle_zone, "middle"),
-        upper_zone=norm_zone(inp.upper_zone, "upper"),
-        lower_perimeter_wall=replace(inp.lower_perimeter_wall.normalized(inp.plan_x_m, inp.plan_y_m), thickness_m=clamp(inp.lower_perimeter_wall.thickness_m, 0.25, 0.60)),
-        middle_perimeter_wall=replace(inp.middle_perimeter_wall.normalized(inp.plan_x_m, inp.plan_y_m), thickness_m=clamp(inp.middle_perimeter_wall.thickness_m, 0.22, 0.50)),
-        upper_perimeter_wall=replace(inp.upper_perimeter_wall.normalized(inp.plan_x_m, inp.plan_y_m), thickness_m=clamp(inp.upper_perimeter_wall.thickness_m, 0.20, 0.45)),
-        retaining_wall=inp.retaining_wall.normalized(inp.plan_x_m, inp.plan_y_m),
-        outrigger_story_levels=sorted({s for s in inp.outrigger_story_levels if 1 <= s <= inp.n_story}),
+def core_wall_group_I(inp: BuildingInput, t: float) -> float:
+    x = inp.core_outer_x / 2.0
+    y = inp.core_outer_y / 2.0
+    top = t * inp.core_outer_x**3 / 12.0 + inp.core_outer_x * t * y**2
+    left = t * inp.core_outer_y**3 / 12.0 + inp.core_outer_y * t * x**2
+    return min(2.0 * top, 2.0 * left)
+
+
+def perimeter_wall_group_I(inp: BuildingInput, t: float, reduction_len: float = 0.16) -> float:
+    lx = inp.plan_x * reduction_len
+    ly = inp.plan_y * reduction_len
+    x = 0.30 * inp.plan_x
+    y = 0.30 * inp.plan_y
+    top = t * lx**3 / 12.0 + lx * t * y**2
+    left = t * ly**3 / 12.0 + ly * t * x**2
+    return min(2.0 * top, 2.0 * left)
+
+
+def _rect_I_min(x: float, y: float) -> float:
+    return min(x * y**3 / 12.0, y * x**3 / 12.0)
+
+
+def frame_components(inp: BuildingInput, m: ZoneMembers) -> Tuple[float, float, float, float]:
+    E = inp.Ec_mpa * 1e6
+    h = inp.story_h
+    n_corner = 4
+    n_per = max(0, 2 * (inp.n_bays_x - 1) + 2 * (inp.n_bays_y - 1))
+    n_total = (inp.n_bays_x + 1) * (inp.n_bays_y + 1)
+    n_int = max(0, n_total - n_corner - n_per)
+    n_beam = inp.n_bays_y * (inp.n_bays_x + 1) + inp.n_bays_x * (inp.n_bays_y + 1)
+
+    Icols = inp.col_cr * (
+        n_corner * _rect_I_min(m.corner_col_x, m.corner_col_y) +
+        n_per * _rect_I_min(m.perimeter_col_x, m.perimeter_col_y) +
+        n_int * _rect_I_min(m.interior_col_x, m.interior_col_y)
     )
+    k_col = 12.0 * E * Icols / max(h**3, 1e-9)
+
+    Ibeam = m.beam_b * m.beam_h**3 / 12.0
+    span = 0.5 * (inp.bay_x + inp.bay_y)
+    k_beam = inp.beam_cr * n_beam * 12.0 * E * Ibeam / max(span**3, 1e-9)
+
+    area = inp.plan_x * inp.plan_y
+    k_slab = inp.slab_cr * 0.0008 * E * area * m.slab_t / max(0.5 * (inp.plan_x + inp.plan_y), 1e-9)
+
+    beam_col_coupled = 1.0 / (1.0 / max(k_col, 1e-9) + 1.0 / max(0.90 * k_beam, 1e-9))
+    frame_total = beam_col_coupled + 0.25 * k_slab
+    return k_col, k_beam, k_slab, frame_total
 
 
-def total_height(inp: BuildingInput) -> float:
-    return inp.n_story * inp.story_height_m
-
-
-def plan_area(inp: BuildingInput) -> float:
-    return inp.plan_x_m * inp.plan_y_m
-
-
-def core_wall_lengths(inp: BuildingInput, wall_count: int) -> List[float]:
-    ox, oy = inp.core_outer_x_m, inp.core_outer_y_m
-    base = [ox, ox, oy, oy]
-    if wall_count >= 6:
-        base += [0.45 * ox, 0.45 * ox]
-    if wall_count >= 8:
-        base += [0.45 * oy, 0.45 * oy]
-    return base
-
-
-def wall_local_I(length: float, thickness: float) -> float:
-    return thickness * length ** 3 / 12.0
-
-
-def zone_column_counts(inp: BuildingInput) -> Tuple[int, int, int]:
-    total = (inp.n_bays_x + 1) * (inp.n_bays_y + 1)
-    corner = 4
-    perimeter = max(0, 2 * (inp.n_bays_x - 1) + 2 * (inp.n_bays_y - 1))
-    interior = max(0, total - corner - perimeter)
-    return corner, perimeter, interior
-
-
-def core_story_stiffness(inp: BuildingInput, z: ZoneMemberInput) -> float:
-    E = inp.Ec_mpa * 1e6
-    h = inp.story_height_m
-    lengths = core_wall_lengths(inp, z.wall_count)
-    # local wall action only; no huge plan-width parallel-axis inflation
-    k = 0.0
-    for L in lengths:
-        I = wall_local_I(L, z.wall_thickness_m)
-        k += 12.0 * E * inp.wall_cracked_factor * I / (h ** 3)
-    # coupling penalty because walls form perforated core, not independent perfect cantilevers
-    return 0.0022 * k
-
-
-def perimeter_wall_story_stiffness(inp: BuildingInput, p: PerimeterWallInput) -> float:
-    E = inp.Ec_mpa * 1e6
-    h = inp.story_height_m
-    lengths = [p.top_length_m, p.bottom_length_m, p.left_length_m, p.right_length_m]
-    k = 0.0
-    for L in lengths:
-        if L <= 0.05:
-            continue
-        I = wall_local_I(L, p.thickness_m)
-        k += 12.0 * E * inp.perimeter_wall_cracked_factor * I / (h ** 3)
-    # strong reduction because not all façade walls participate fully in one translational direction
-    return 0.0008 * k
-
-
-def column_story_stiffness(inp: BuildingInput, z: ZoneMemberInput) -> float:
-    E = inp.Ec_mpa * 1e6
-    h = inp.story_height_m
-    corner_n, perim_n, inter_n = zone_column_counts(inp)
-
-    def I_rect(b: float, d: float) -> float:
-        return max(b * d ** 3 / 12.0, d * b ** 3 / 12.0)
-
-    k = 0.0
-    k += corner_n * 12 * E * inp.column_cracked_factor * I_rect(z.corner_col_x_m, z.corner_col_y_m) / (h ** 3)
-    k += perim_n * 12 * E * inp.column_cracked_factor * I_rect(z.perimeter_col_x_m, z.perimeter_col_y_m) / (h ** 3)
-    k += inter_n * 12 * E * inp.column_cracked_factor * I_rect(z.interior_col_x_m, z.interior_col_y_m) / (h ** 3)
-    return 0.012 * k
-
-
-def beam_coupling_factor(inp: BuildingInput, z: ZoneMemberInput) -> float:
-    span = 0.5 * (inp.bay_x_m + inp.bay_y_m)
-    E = inp.Ec_mpa * 1e6
-    Ib = z.beam_width_m * z.beam_depth_m ** 3 / 12.0
-    kb = 12 * E * inp.beam_cracked_factor * Ib / (span ** 3)
-    # transform to moderate continuity factor for frame action
-    return 1.0 + clamp(kb / 1.2e8, 0.05, 0.30)
-
-
-def floor_mass_kg(inp: BuildingInput, z: ZoneMemberInput, p: PerimeterWallInput) -> float:
-    area = plan_area(inp)
-    q = (inp.super_dead_load_kpa + 0.25 * inp.live_load_kpa)  # seismic mass load in kN/m²
-    slab_w = z.slab_thickness_m * area * CONCRETE_UNIT_WEIGHT
-    façade = inp.facade_line_load_kn_m * (2 * (inp.plan_x_m + inp.plan_y_m))
-    lengths = sum(core_wall_lengths(inp, z.wall_count))
-    core_w = lengths * z.wall_thickness_m * inp.story_height_m * CONCRETE_UNIT_WEIGHT
-    perim_w = (p.top_length_m + p.bottom_length_m + p.left_length_m + p.right_length_m) * p.thickness_m * inp.story_height_m * CONCRETE_UNIT_WEIGHT
-    corner_n, perim_n, inter_n = zone_column_counts(inp)
-    col_area = (
-        corner_n * z.corner_col_x_m * z.corner_col_y_m
-        + perim_n * z.perimeter_col_x_m * z.perimeter_col_y_m
-        + inter_n * z.interior_col_x_m * z.interior_col_y_m
-    )
-    col_w = col_area * inp.story_height_m * CONCRETE_UNIT_WEIGHT
-    beam_len = inp.n_bays_y * (inp.n_bays_x + 1) * inp.bay_x_m + inp.n_bays_x * (inp.n_bays_y + 1) * inp.bay_y_m
-    beam_w = beam_len * z.beam_width_m * z.beam_depth_m * CONCRETE_UNIT_WEIGHT
-    total_kn = (q * area + slab_w + façade + core_w + perim_w + col_w + beam_w) * inp.seismic_mass_factor
-    return total_kn * 1000.0 / G
-
-
-def chs_properties(od_mm: float, t_mm: float) -> Tuple[float, float]:
-    D = od_mm / 1000.0
-    t = min(t_mm / 1000.0, 0.49 * D)
-    A = pi / 4.0 * (D ** 2 - (D - 2 * t) ** 2)
-    I = pi / 64.0 * (D ** 4 - (D - 2 * t) ** 4)
-    r = sqrt(I / max(A, 1e-12))
-    return A, r
-
-
-def auto_generated_brace_lines(inp: BuildingInput) -> Dict[int, List[BraceLine]]:
-    cx0 = (inp.plan_x_m - inp.core_outer_x_m) / 2.0
-    cx1 = cx0 + inp.core_outer_x_m
-    cy0 = (inp.plan_y_m - inp.core_outer_y_m) / 2.0
-    cy1 = cy0 + inp.core_outer_y_m
-
-    x_cols = [i * inp.bay_x_m for i in range(inp.n_bays_x + 1)]
-    y_cols = [j * inp.bay_y_m for j in range(inp.n_bays_y + 1)]
-
-    center_x = inp.plan_x_m / 2.0
-    center_y = inp.plan_y_m / 2.0
-
-    def nearest_two(values: List[float], center: float, lo: float, hi: float) -> List[float]:
-        cand = [v for v in values if v < lo or v > hi]
-        cand.sort(key=lambda v: abs(v - center))
-        chosen = cand[:2] if len(cand) >= 2 else cand[:1]
-        return sorted(chosen)
-
-    top_targets = nearest_two(x_cols, center_x, cx0, cx1)
-    bot_targets = top_targets[:]
-    left_targets = nearest_two(y_cols, center_y, cy0, cy1)
-    right_targets = left_targets[:]
-
-    lines: List[BraceLine] = []
-    for x in top_targets:
-        lines.append(BraceLine((cx0 + cx1) / 2, cy1, x, inp.plan_y_m, "top", f"X={x:.1f}"))
-    for x in bot_targets:
-        lines.append(BraceLine((cx0 + cx1) / 2, cy0, x, 0.0, "bottom", f"X={x:.1f}"))
-    for y in left_targets:
-        lines.append(BraceLine(cx0, (cy0 + cy1) / 2, 0.0, y, "left", f"Y={y:.1f}"))
-    for y in right_targets:
-        lines.append(BraceLine(cx1, (cy0 + cy1) / 2, inp.plan_x_m, y, "right", f"Y={y:.1f}"))
-
-    return {story: lines[:] for story in inp.outrigger_story_levels}
-
-
-def brace_story_stiffness(inp: BuildingInput, brace_lines: List[BraceLine]) -> Tuple[float, OutriggerLevelResult]:
+def outrigger_story_stiffness(inp: BuildingInput) -> float:
     E = inp.Es_mpa * 1e6
-    A, r = chs_properties(inp.brace_input.outer_diameter_mm, inp.brace_input.thickness_mm)
-    h = inp.story_height_m
-    k_total = 0.0
-    lam_max = 0.0
-    for line in brace_lines:
-        dx = line.x1 - line.x0
-        dy = line.y1 - line.y0
-        horizontal = sqrt(dx * dx + dy * dy)
-        L = sqrt(horizontal ** 2 + h ** 2)
-        cos2 = (horizontal / max(L, 1e-9)) ** 2
-        lam = inp.brace_input.k_factor * L / max(r, 1e-9)
-        lam_max = max(lam_max, lam)
-        k_axial = E * A / max(L, 1e-9)
-        k_total += inp.brace_input.buckling_reduction * k_axial * cos2
-    k_total *= 15.00  # equivalent outrigger system efficiency
-    story = 0
-    res = OutriggerLevelResult(
-        story=story,
-        elevation_m=0.0,
-        brace_count=len(brace_lines),
-        od_mm=inp.brace_input.outer_diameter_mm,
-        t_mm=inp.brace_input.thickness_mm,
-        area_cm2=A * 1e4,
-        slenderness=lam_max,
-        k_eff_gn_m=k_total / 1e9,
-    )
-    return k_total, res
+    d = inp.brace.outer_diameter_mm
+    t = inp.brace.thickness_mm
+    A = chs_area_mm2(d, t) * 1e-6
+    arm = 0.5 * max(inp.plan_x - inp.core_outer_x, inp.plan_y - inp.core_outer_y)
+    L = sqrt(arm**2 + inp.story_h**2)
+    k_axial = E * A / max(inp.brace.k_factor * L, 1e-9)
+    return inp.brace.buckling_reduction * 4.0 * k_axial * (arm / max(inp.story_h, 1e-9))**2 * 0.08
 
 
 def retaining_base_spring(inp: BuildingInput) -> float:
-    rw = inp.retaining_wall.normalized(inp.plan_x_m, inp.plan_y_m)
-    if not rw.enabled or inp.n_basement <= 0:
+    if not inp.retaining_enabled or inp.n_basement <= 0:
         return 0.0
     E = inp.Ec_mpa * 1e6
-    h = max(inp.basement_height_m * max(inp.n_basement, 1), 1.0)
-    lengths = [rw.top_length_m, rw.bottom_length_m, rw.left_length_m, rw.right_length_m]
-    k = 0.0
-    for L in lengths:
-        I = wall_local_I(L, rw.thickness_m)
-        k += 3.0 * E * I / (h ** 3)
-    return 0.03 * rw.stiffness_reduction * k
+    h = max(inp.n_basement * inp.basement_h, 1e-9)
+    t = inp.retaining_t
+    l_eff_x = 0.16 * inp.plan_x
+    l_eff_y = 0.16 * inp.plan_y
+    I = min(2.0 * (t * l_eff_x**3 / 12.0), 2.0 * (t * l_eff_y**3 / 12.0))
+    return inp.retaining_reduction * 3.0 * E * I / max(h**3, 1e-9)
 
 
-def build_story_arrays(inp: BuildingInput) -> Tuple[np.ndarray, np.ndarray, List[StoryRow], List[ZoneSummary], List[OutriggerLevelResult], Dict[int, List[BraceLine]]]:
-    zones = define_zones(inp.n_story)
-    brace_lines_by_story = auto_generated_brace_lines(inp)
-    k_story: List[float] = []
-    m_story: List[float] = []
-    rows: List[StoryRow] = []
-    outrigger_rows: List[OutriggerLevelResult] = []
+def story_mass(inp: BuildingInput, m: ZoneMembers) -> float:
+    area = inp.plan_x * inp.plan_y
+    q = 6.0 + CONCRETE_UNIT_WEIGHT * m.slab_t
+    W = area * q
+    return (W * 1000.0) / G
 
+
+def build_story_arrays(inp: BuildingInput) -> Tuple[List[StoryState], np.ndarray, np.ndarray, List[int], Dict[str, int]]:
+    brace_levels = auto_brace_levels(inp)
+    brace_counts = brace_zone_count(inp, brace_levels)
+    E = inp.Ec_mpa * 1e6
     base_spring = retaining_base_spring(inp)
 
-    for story in range(1, inp.n_story + 1):
-        zone = zone_for_story(zones, story)
-        zm = zone_member(inp, zone.name)
-        pw = zone_perimeter_wall(inp, zone.name)
+    states: List[StoryState] = []
+    masses: List[float] = []
+    k_story: List[float] = []
 
-        k_core = core_story_stiffness(inp, zm)
-        k_perim = perimeter_wall_story_stiffness(inp, pw)
-        k_cols = column_story_stiffness(inp, zm)
-        frame_factor = beam_coupling_factor(inp, zm)
-        k_frame = k_cols * frame_factor
-        k = k_core + k_perim + k_frame
+    for s in range(1, inp.n_story + 1):
+        z, m = zone_for_story(inp, s)
+        brace_here = s in brace_levels
+        z_braces = brace_counts[z.name]
+        zone_h = z.n_stories * inp.story_h
 
-        brace_level = "No"
-        if story in brace_lines_by_story:
-            k_br, br_res = brace_story_stiffness(inp, brace_lines_by_story[story])
-            brace_level = "Yes"
-            br_res.story = story
-            br_res.elevation_m = story * inp.story_height_m
-            outrigger_rows.append(br_res)
-            k += k_br
+        I_core = inp.wall_cr * core_wall_group_I(inp, m.wall_t)
+        k_core_raw = 3.0 * E * I_core / max((zone_h**3) / z.n_stories, 1e-9)
 
-        if story == 1 and base_spring > 0.0:
-            k += base_spring
+        I_per = inp.perimeter_wall_cr * perimeter_wall_group_I(inp, m.perimeter_wall_t)
+        k_per_raw = 3.0 * E * I_per / max((zone_h**3) / z.n_stories, 1e-9)
 
-        m = floor_mass_kg(inp, zm, pw)
-        k_story.append(k)
-        m_story.append(m)
-        rows.append(StoryRow(
-            story=story,
-            zone=zone.name,
-            brace_level=brace_level,
-            wall_t_m=zm.wall_thickness_m,
-            perimeter_wall_t_m=pw.thickness_m,
-            beam_b_m=zm.beam_width_m,
-            beam_h_m=zm.beam_depth_m,
-            slab_t_m=zm.slab_thickness_m,
-            corner_col_m=f"{zm.corner_col_x_m:.2f}x{zm.corner_col_y_m:.2f}",
-            perimeter_col_m=f"{zm.perimeter_col_x_m:.2f}x{zm.perimeter_col_y_m:.2f}",
-            interior_col_m=f"{zm.interior_col_x_m:.2f}x{zm.interior_col_y_m:.2f}",
-            story_stiffness_gn_m=k / 1e9,
-            story_mass_ton=m / 1000.0,
-        ))
+        k_col, k_beam, k_slab, k_frame_raw = frame_components(inp, m)
 
-    zone_summaries = []
-    for z in zones:
-        zm = zone_member(inp, z.name)
-        pw = zone_perimeter_wall(inp, z.name)
-        zone_summaries.append(ZoneSummary(
+        beam_col_ratio = k_beam / max(k_col, 1e-9)
+        frame_core_ratio = k_frame_raw / max(k_core_raw, 1e-9)
+
+        frame_compat = clamp(0.82 + 0.16 * min(beam_col_ratio, 1.20), 0.72, 0.96)
+        core_compat = clamp(0.82 + 0.16 * min(frame_core_ratio, 1.10), 0.72, 0.96)
+        perim_compat = clamp(0.68 + 0.10 * min(k_frame_raw / max(k_per_raw, 1e-9), 1.00), 0.56, 0.82)
+
+        k_core = k_core_raw * core_compat
+        k_per = k_per_raw * perim_compat
+        k_frame = k_frame_raw * frame_compat
+
+        zone_force_amplifier = 1.0 + 0.06 * z_braces
+        if brace_here:
+            zone_force_amplifier += 0.04
+
+        k_core *= zone_force_amplifier
+        k_frame *= (1.0 + 0.04 * z_braces)
+        k_per *= (1.0 + 0.02 * z_braces)
+
+        k_out = outrigger_story_stiffness(inp) if brace_here else 0.0
+        k_out_eff = k_out * (0.55 + 0.20 * min(k_core / max(k_frame, 1e-9), 1.2))
+
+        k_total = k_core + k_per + k_frame + k_out_eff
+        if s == 1:
+            k_total += base_spring
+
+        masses.append(story_mass(inp, m))
+        k_story.append(k_total)
+        states.append(StoryState(
+            story=s,
             zone=z.name,
-            stories=f"{z.story_start}-{z.story_end}",
-            core_wall_t_m=zm.wall_thickness_m,
-            perimeter_wall_t_m=pw.thickness_m,
-            beam_b_m=zm.beam_width_m,
-            beam_h_m=zm.beam_depth_m,
-            slab_t_m=zm.slab_thickness_m,
-            corner_col=f"{zm.corner_col_x_m:.2f}x{zm.corner_col_y_m:.2f}",
-            perimeter_col=f"{zm.perimeter_col_x_m:.2f}x{zm.perimeter_col_y_m:.2f}",
-            interior_col=f"{zm.interior_col_x_m:.2f}x{zm.interior_col_y_m:.2f}",
-            core_wall_count=zm.wall_count,
+            brace_level=brace_here,
+            wall_t=m.wall_t,
+            perimeter_wall_t=m.perimeter_wall_t,
+            beam_b=m.beam_b,
+            beam_h=m.beam_h,
+            slab_t=m.slab_t,
+            corner_col=f"{m.corner_col_x:.2f}x{m.corner_col_y:.2f}",
+            perimeter_col=f"{m.perimeter_col_x:.2f}x{m.perimeter_col_y:.2f}",
+            interior_col=f"{m.interior_col_x:.2f}x{m.interior_col_y:.2f}",
+            k_core=k_core,
+            k_perimeter_walls=k_per,
+            k_frame=k_frame,
+            k_outrigger=k_out_eff,
+            k_total=k_total,
+            mass_t=masses[-1] / 1000.0,
         ))
 
-    return np.array(k_story, dtype=float), np.array(m_story, dtype=float), rows, zone_summaries, outrigger_rows, brace_lines_by_story
-
-
-def build_m_k(masses: np.ndarray, stiffness: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    n = len(masses)
     M = np.diag(masses)
+    n = len(k_story)
     K = np.zeros((n, n), dtype=float)
-    for i in range(n):
-        ki = stiffness[i]
+    for i, ki in enumerate(k_story):
         if i == 0:
             K[i, i] += ki
         else:
@@ -621,502 +353,499 @@ def build_m_k(masses: np.ndarray, stiffness: np.ndarray) -> Tuple[np.ndarray, np
             K[i, i - 1] -= ki
             K[i - 1, i] -= ki
             K[i - 1, i - 1] += ki
-    return M, K
+    return states, M, K, brace_levels, brace_counts
 
 
-def modal_analysis(masses: np.ndarray, stiffness: np.ndarray, modes: int = 5) -> ModalResult:
-    M, K = build_m_k(masses, stiffness)
-    A = np.linalg.solve(M, K)
-    vals, vecs = np.linalg.eig(A)
-    vals = np.real(vals)
-    vecs = np.real(vecs)
-    mask = vals > 1e-9
-    vals = vals[mask]
-    vecs = vecs[:, mask]
-    idx = np.argsort(vals)
-    vals = vals[idx]
-    vecs = vecs[:, idx]
-
-    omegas = np.sqrt(vals[:modes])
-    periods = [2 * pi / w for w in omegas]
-    freqs = [w / (2 * pi) for w in omegas]
-
-    ones = np.ones((len(masses), 1))
-    Mmat = np.diag(masses)
-    total_m = masses.sum()
-    mode_shapes = []
-    ratios = []
-    for i in range(len(periods)):
-        phi = vecs[:, i].reshape(-1, 1)
-        denom = (phi.T @ Mmat @ phi).item()
-        gamma = (phi.T @ Mmat @ ones).item() / denom
-        meff = gamma ** 2 * denom
-        ratios.append(meff / total_m)
-        shp = phi.flatten()
-        shp = shp / max(abs(shp[-1]), 1e-12)
-        if shp[-1] < 0:
-            shp = -shp
-        mode_shapes.append(shp)
-    return ModalResult(periods_s=periods, frequencies_hz=freqs, mode_shapes=mode_shapes, effective_mass_ratios=ratios)
+def modal_analysis(M: np.ndarray, K: np.ndarray, modes: int = 3) -> Tuple[List[float], np.ndarray, np.ndarray]:
+    evals, evecs = np.linalg.eig(np.linalg.solve(M, K))
+    evals = np.real(evals)
+    evecs = np.real(evecs)
+    pos = evals > 1e-10
+    evals = evals[pos]
+    evecs = evecs[:, pos]
+    order = np.argsort(evals)
+    evals = evals[order]
+    evecs = evecs[:, order]
+    omegas = np.sqrt(evals[:modes])
+    periods = [2.0 * pi / w for w in omegas]
+    return periods, omegas, evecs[:, :modes]
 
 
-def static_response(masses: np.ndarray, stiffness: np.ndarray, base_shear_ratio: float = 0.015) -> Tuple[np.ndarray, np.ndarray, float, float]:
-    M, K = build_m_k(masses, stiffness)
-    W = masses.sum() * G
-    V = base_shear_ratio * W
-    n = len(masses)
-    heights = np.arange(1, n + 1, dtype=float)
+def static_response(inp: BuildingInput, K: np.ndarray, total_weight_kN: float) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
+    n = K.shape[0]
+    V = inp.seismic_coeff * total_weight_kN * 1000.0
+    heights = np.arange(1, n + 1, dtype=float) * inp.story_h
     F = V * heights / heights.sum()
-    u = np.linalg.solve(K, F)
-    drifts = np.empty_like(u)
-    drifts[0] = u[0]
-    drifts[1:] = u[1:] - u[:-1]
-    return u, drifts, float(u[-1]), float(np.max(np.abs(drifts)))
+    u = np.linalg.solve(K, F.reshape(-1, 1)).flatten()
+    roof = float(u[-1])
+    drifts = np.diff(np.r_[0.0, u])
+    max_drift = float(np.max(np.abs(drifts)))
+    return roof, max_drift, max_drift / inp.story_h, u, drifts
 
 
-def code_period(inp: BuildingInput) -> float:
-    return inp.Ct * total_height(inp) ** inp.x_exp
+def total_weight_kN(inp: BuildingInput) -> float:
+    W = 0.0
+    for s in range(1, inp.n_story + 1):
+        _, m = zone_for_story(inp, s)
+        area = inp.plan_x * inp.plan_y
+        q = 6.0 + CONCRETE_UNIT_WEIGHT * m.slab_t
+        W += area * q
+    return W
 
 
-def scale_zone_member(inp: BuildingInput, z: ZoneMemberInput, factor: float, band: str) -> ZoneMemberInput:
-    story_beam_max = 0.28 * inp.story_height_m
-    if band == "lower":
-        wall_min, col_min = 0.55, 0.95
-    elif band == "middle":
-        wall_min, col_min = 0.40, 0.75
-    else:
-        wall_min, col_min = 0.30, 0.55
-    return replace(
-        z,
-        wall_thickness_m=clamp(z.wall_thickness_m * factor, wall_min, 1.20),
-        beam_width_m=clamp(z.beam_width_m * (0.90 + 0.10 * factor), 0.30, 0.75),
-        beam_depth_m=clamp(z.beam_depth_m * factor, 0.60, min(1.40, story_beam_max)),
-        slab_thickness_m=clamp(z.slab_thickness_m * (0.95 + 0.05 * factor), 0.18, 0.35),
-        corner_col_x_m=clamp(z.corner_col_x_m * factor, col_min, 1.80),
-        corner_col_y_m=clamp(z.corner_col_y_m * factor, col_min, 1.80),
-        perimeter_col_x_m=clamp(z.perimeter_col_x_m * factor, col_min - 0.10, 1.60),
-        perimeter_col_y_m=clamp(z.perimeter_col_y_m * factor, col_min - 0.10, 1.60),
-        interior_col_x_m=clamp(z.interior_col_x_m * factor, col_min - 0.20, 1.40),
-        interior_col_y_m=clamp(z.interior_col_y_m * factor, col_min - 0.20, 1.40),
+def code_periods(inp: BuildingInput) -> Tuple[float, float]:
+    H = inp.n_story * inp.story_h
+    t_code = inp.Ct * H**inp.x_exp
+    return t_code, inp.Cu * t_code
+
+
+def stiffness_contributions(states: List[StoryState]) -> Dict[str, float]:
+    return {
+        "Core": sum(s.k_core for s in states),
+        "Perimeter walls": sum(s.k_perimeter_walls for s in states),
+        "Frame (beam+column+slab)": sum(s.k_frame for s in states),
+        "Outriggers": sum(s.k_outrigger for s in states),
+    }
+
+
+def scale_zone(m: ZoneMembers, story_h: float, beam_col_factor: float, wall_factor: float, perim_factor: float, slab_factor: float, brace_bonus: float = 1.0) -> ZoneMembers:
+    beam_h = clamp(m.beam_h * beam_col_factor * brace_bonus, 0.60, 0.32 * story_h)
+    beam_b = clamp(m.beam_b * (0.94 + 0.10 * beam_col_factor) * (0.98 + 0.02 * brace_bonus), 0.40, 1.00)
+    return ZoneMembers(
+        wall_t=clamp(m.wall_t * wall_factor * brace_bonus, 0.45, 1.40),
+        perimeter_wall_t=clamp(m.perimeter_wall_t * perim_factor * (0.98 + 0.02 * brace_bonus), 0.20, 0.70),
+        beam_b=beam_b,
+        beam_h=beam_h,
+        slab_t=clamp(m.slab_t * slab_factor, 0.18, 0.34),
+        corner_col_x=clamp(m.corner_col_x * beam_col_factor * brace_bonus, 0.80, 1.80),
+        corner_col_y=clamp(m.corner_col_y * beam_col_factor * brace_bonus, 0.80, 1.80),
+        perimeter_col_x=clamp(m.perimeter_col_x * beam_col_factor * brace_bonus, 0.75, 1.60),
+        perimeter_col_y=clamp(m.perimeter_col_y * beam_col_factor * brace_bonus, 0.75, 1.60),
+        interior_col_x=clamp(m.interior_col_x * beam_col_factor, 0.70, 1.50),
+        interior_col_y=clamp(m.interior_col_y * beam_col_factor, 0.70, 1.50),
     )
 
 
-def scale_perimeter_wall(p: PerimeterWallInput, factor: float, band: str) -> PerimeterWallInput:
-    if band == "lower":
-        tmin = 0.25
-    elif band == "middle":
-        tmin = 0.22
-    else:
-        tmin = 0.20
-    return replace(p, thickness_m=clamp(p.thickness_m * factor, tmin, 0.60))
+def auto_size(inp: BuildingInput, max_iter: int = 20) -> Tuple[BuildingInput, pd.DataFrame]:
+    log = []
+    current = replace(inp)
+    t_code, t_ceiling = code_periods(current)
+    target_floor = 0.72 * t_code
 
+    for it in range(1, max_iter + 1):
+        states, M, K, brace_levels, brace_counts = build_story_arrays(current)
+        periods, _, _ = modal_analysis(M, K, modes=3)
+        W = total_weight_kN(current)
+        roof, _, drift_ratio, _, _ = static_response(current, K, W)
+        contrib = stiffness_contributions(states)
+        total_k = sum(contrib.values())
+        shares = {k: v / max(total_k, 1e-9) for k, v in contrib.items()}
 
-def auto_size(inp: BuildingInput, iterations: int = 16) -> BuildingInput:
-    if not inp.auto_size:
-        return inp
-    work = normalize_input(inp)
-    T_code = code_period(work)
-    T_low = 0.65 * T_code
-    T_high = work.Cu * T_code
+        log.append({
+            "iter": it,
+            "T1": periods[0],
+            "roof_disp_m": roof,
+            "max_story_drift_ratio": drift_ratio,
+            "core_share": shares["Core"],
+            "frame_share": shares["Frame (beam+column+slab)"],
+            "perim_share": shares["Perimeter walls"],
+            "outrigger_share": shares["Outriggers"],
+        })
 
-    for _ in range(iterations):
-        k, m, *_ = build_story_arrays(work)
-        modal = modal_analysis(m, k, modes=1)
-        T1 = modal.periods_s[0]
-        _, dr, _, dmax = static_response(m, k)
-        drift_ratio = dmax / work.story_height_m
-
-        need_stiffer = T1 > T_high or drift_ratio > work.drift_limit_ratio
-        need_softer = T1 < T_low and drift_ratio < 0.65 * work.drift_limit_ratio
-        if not need_stiffer and not need_softer:
+        ok = (periods[0] <= t_ceiling) and (drift_ratio <= current.drift_limit) and (periods[0] >= target_floor)
+        if ok:
             break
-        fac = 1.08 if need_stiffer else 0.94
-        work = replace(
-            work,
-            lower_zone=scale_zone_member(work, work.lower_zone, fac, "lower"),
-            middle_zone=scale_zone_member(work, work.middle_zone, fac, "middle"),
-            upper_zone=scale_zone_member(work, work.upper_zone, fac, "upper"),
-            lower_perimeter_wall=scale_perimeter_wall(work.lower_perimeter_wall, fac, "lower"),
-            middle_perimeter_wall=scale_perimeter_wall(work.middle_perimeter_wall, fac, "middle"),
-            upper_perimeter_wall=scale_perimeter_wall(work.upper_perimeter_wall, fac, "upper"),
+
+        stiff_need = max((periods[0] / t_ceiling) ** 2 if periods[0] > t_ceiling else 1.0,
+                         (drift_ratio / current.drift_limit) ** 1.10 if drift_ratio > current.drift_limit else 1.0)
+        soften_need = (target_floor / max(periods[0], 1e-9)) ** 0.32 if periods[0] < target_floor else 1.0
+
+        desired = {
+            "Core": 0.40,
+            "Frame (beam+column+slab)": 0.32,
+            "Perimeter walls": 0.16,
+            "Outriggers": 0.12,
+        }
+
+        if stiff_need > 1.0:
+            beam_col = stiff_need ** 0.15
+            wall = stiff_need ** 0.16
+            perim = stiff_need ** 0.09
+            slab = stiff_need ** 0.04
+        else:
+            beam_col = 1.0 / (soften_need ** 0.12)
+            wall = 1.0 / (soften_need ** 0.14)
+            perim = 1.0 / (soften_need ** 0.07)
+            slab = 1.0 / (soften_need ** 0.03)
+
+        frame_gap = desired["Frame (beam+column+slab)"] - shares["Frame (beam+column+slab)"]
+        core_gap = desired["Core"] - shares["Core"]
+        perim_gap = desired["Perimeter walls"] - shares["Perimeter walls"]
+
+        beam_col *= 1.0 + 0.22 * frame_gap + 0.10 * max(core_gap, 0.0)
+        wall *= 1.0 + 0.24 * core_gap + 0.10 * max(frame_gap, 0.0)
+        perim *= 1.0 + 0.16 * perim_gap
+
+        lower_bonus = 1.0 + 0.05 * brace_counts["Lower Zone"]
+        middle_bonus = 1.0 + 0.05 * brace_counts["Middle Zone"]
+        upper_bonus = 1.0 + 0.05 * brace_counts["Upper Zone"]
+
+        current = replace(
+            current,
+            lower=scale_zone(current.lower, current.story_h, beam_col * 1.05, wall * 1.10, perim * 1.03, slab, lower_bonus),
+            middle=scale_zone(current.middle, current.story_h, beam_col, wall, perim, slab, middle_bonus),
+            upper=scale_zone(current.upper, current.story_h, beam_col * 0.96, wall * 0.94, perim * 0.97, slab, upper_bonus),
         )
-    return work
+
+    return current, pd.DataFrame(log)
+
+
+def system_force_table(states: List[StoryState], base_shear_kN: float) -> pd.DataFrame:
+    contrib = stiffness_contributions(states)
+    total = sum(contrib.values())
+    rows = []
+    for name, k in contrib.items():
+        share = k / max(total, 1e-9)
+        rows.append({
+            "System": name,
+            "Stiffness share": share,
+            "Approx. shear (kN)": share * base_shear_kN,
+        })
+    return pd.DataFrame(rows)
+
+
+def brace_force_table(inp: BuildingInput, states: List[StoryState], displacements: np.ndarray) -> pd.DataFrame:
+    levels = [s.story for s in states if s.brace_level]
+    k_out = outrigger_story_stiffness(inp)
+    rows = []
+    for lv in levels:
+        idx = lv - 1
+        u = abs(displacements[idx])
+        F_level = k_out * u / 1000.0
+        rows.append({
+            "Brace level": lv,
+            "Story disp. (m)": u,
+            "Approx. total outrigger force (kN)": F_level,
+            "Approx. force per line (kN)": F_level / 4.0,
+        })
+    return pd.DataFrame(rows)
 
 
 def analyze(inp: BuildingInput) -> AnalysisResult:
-    inp = normalize_input(inp)
-    inp = auto_size(inp)
-    zones = define_zones(inp.n_story)
-    k, m, story_rows, zone_summaries, outrigger_rows, brace_lines_by_story = build_story_arrays(inp)
-    modal = modal_analysis(m, k, modes=5)
-    u, drifts, roof_disp, max_drift = static_response(m, k)
-    total_weight_kn = float(m.sum() * G / 1000.0)
+    sized, log = auto_size(inp)
+    states, M, K, brace_levels, brace_counts = build_story_arrays(sized)
+    periods, _, _ = modal_analysis(M, K, modes=3)
+    W = total_weight_kN(sized)
+    roof, max_drift, drift_ratio, u, _ = static_response(sized, K, W)
+    t_code, t_ceiling = code_periods(sized)
+
+    story_df = pd.DataFrame([{
+        "Story": s.story,
+        "Zone": s.zone,
+        "Brace level": "Yes" if s.brace_level else "No",
+        "Wall t (m)": round(s.wall_t, 3),
+        "Perimeter wall t (m)": round(s.perimeter_wall_t, 3),
+        "Beam b (m)": round(s.beam_b, 3),
+        "Beam h (m)": round(s.beam_h, 3),
+        "Slab t (m)": round(s.slab_t, 3),
+        "Corner col": s.corner_col,
+        "Perimeter col": s.perimeter_col,
+        "Interior col": s.interior_col,
+        "K_core (GN/m)": s.k_core / 1e9,
+        "K_perim (GN/m)": s.k_perimeter_walls / 1e9,
+        "K_frame (GN/m)": s.k_frame / 1e9,
+        "K_outrigger (GN/m)": s.k_outrigger / 1e9,
+        "K_total (GN/m)": s.k_total / 1e9,
+        "Mass (t)": s.mass_t,
+        "Disp. (m)": u[s.story - 1],
+    } for s in states])
+
+    zone_rows = []
+    for z in define_zones(sized.n_story):
+        m = sized.lower if z.name == "Lower Zone" else sized.middle if z.name == "Middle Zone" else sized.upper
+        zone_rows.append({
+            "Zone": z.name,
+            "Stories": f"{z.story_start}-{z.story_end}",
+            "Brace levels in zone": brace_counts[z.name],
+            "Core wall t (m)": m.wall_t,
+            "Perimeter wall t (m)": m.perimeter_wall_t,
+            "Beam b x h (m)": f"{m.beam_b:.2f} x {m.beam_h:.2f}",
+            "Slab t (m)": m.slab_t,
+            "Corner col (m)": f"{m.corner_col_x:.2f} x {m.corner_col_y:.2f}",
+            "Perimeter col (m)": f"{m.perimeter_col_x:.2f} x {m.perimeter_col_y:.2f}",
+            "Interior col (m)": f"{m.interior_col_x:.2f} x {m.interior_col_y:.2f}",
+        })
+    zone_df = pd.DataFrame(zone_rows)
+
+    contrib = stiffness_contributions(states)
+    contrib_df = pd.DataFrame({
+        "System": list(contrib.keys()),
+        "Total stiffness (GN/m)": [v / 1e9 for v in contrib.values()],
+        "Share": [v / sum(contrib.values()) for v in contrib.values()],
+    })
+    V_kN = sized.seismic_coeff * W
+
     return AnalysisResult(
-        inp=inp,
-        zones=zones,
-        zone_summaries=zone_summaries,
-        story_rows=story_rows,
-        modal=modal,
-        roof_disp_m=roof_disp,
+        periods=periods,
+        roof_disp_m=roof,
         max_story_drift_m=max_drift,
-        max_story_drift_ratio=max_drift / inp.story_height_m,
-        story_displacements_m=u,
-        story_drifts_m=drifts,
-        story_stiffness_n_m=k,
-        story_masses_kg=m,
-        outrigger_results=outrigger_rows,
-        brace_lines_by_story=brace_lines_by_story,
-        t_code_s=code_period(inp),
-        t_upper_s=inp.Cu * code_period(inp),
-        total_weight_kn=total_weight_kn,
+        max_story_drift_ratio=drift_ratio,
+        code_period=t_code,
+        period_ceiling=t_ceiling,
+        brace_levels=brace_levels,
+        brace_zone_count=brace_counts,
+        story_table=story_df,
+        zone_table=zone_df,
+        contribution_table=contrib_df,
+        iteration_log=log,
+        system_force_table=system_force_table(states, V_kN),
+        brace_force_table=brace_force_table(sized, states, u),
+        resized_input=sized,
     )
 
 
-# ----------------------------- TABLES -----------------------------
-
-def summary_df(res: AnalysisResult) -> pd.DataFrame:
-    return pd.DataFrame({
-        "Parameter": [
-            "Height (m)", "Stories", "Basements", "Plan X (m)", "Plan Y (m)",
-            "Core outer X (m)", "Core outer Y (m)", "Core opening X (m)", "Core opening Y (m)",
-            "T1 (s)", "T2 (s)", "T3 (s)", "Code reference period T_code (s)", "Upper code period Cu*T_code (s)",
-            "Roof displacement (m)", "Max story drift (m)", "Max story drift ratio", "Total weight (kN)",
-            "Retaining wall active", "Outrigger levels",
-        ],
-        "Value": [
-            total_height(res.inp), res.inp.n_story, res.inp.n_basement, res.inp.plan_x_m, res.inp.plan_y_m,
-            res.inp.core_outer_x_m, res.inp.core_outer_y_m, res.inp.core_opening_x_m, res.inp.core_opening_y_m,
-            res.modal.periods_s[0], res.modal.periods_s[1], res.modal.periods_s[2], res.t_code_s, res.t_upper_s,
-            res.roof_disp_m, res.max_story_drift_m, res.max_story_drift_ratio, res.total_weight_kn,
-            "Yes" if res.inp.retaining_wall.enabled and res.inp.n_basement > 0 else "No",
-            ", ".join(str(s) for s in res.inp.outrigger_story_levels) if res.inp.outrigger_story_levels else "None",
-        ]
-    })
-
-
-def zones_df(res: AnalysisResult) -> pd.DataFrame:
-    return pd.DataFrame([z.__dict__ for z in res.zone_summaries])
-
-
-def stories_df(res: AnalysisResult) -> pd.DataFrame:
-    return pd.DataFrame([r.__dict__ for r in res.story_rows])
-
-
-def outriggers_df(res: AnalysisResult) -> pd.DataFrame:
-    if not res.outrigger_results:
-        return pd.DataFrame(columns=["story", "elevation_m", "brace_count", "od_mm", "t_mm", "area_cm2", "slenderness", "k_eff_gn_m"])
-    return pd.DataFrame([o.__dict__ for o in res.outrigger_results])
-
-
-def drifts_df(res: AnalysisResult) -> pd.DataFrame:
-    return pd.DataFrame({
-        "story": np.arange(1, res.inp.n_story + 1),
-        "displacement_m": res.story_displacements_m,
-        "story_drift_m": res.story_drifts_m,
-        "story_drift_ratio": res.story_drifts_m / res.inp.story_height_m,
-    })
-
-
-# ----------------------------- PLOTS -----------------------------
-
-def plot_plan(res: AnalysisResult, story_for_braces: Optional[int] = None) -> plt.Figure:
-    inp = res.inp
-    fig, ax = plt.subplots(figsize=(10, 8))
-    ax.plot([0, inp.plan_x_m, inp.plan_x_m, 0, 0], [0, 0, inp.plan_y_m, inp.plan_y_m, 0], color="black", lw=1.5)
-
-    for i in range(inp.n_bays_x + 1):
-        x = i * inp.bay_x_m
-        ax.plot([x, x], [0, inp.plan_y_m], color="#d0d0d0", lw=0.7)
-    for j in range(inp.n_bays_y + 1):
-        y = j * inp.bay_y_m
-        ax.plot([0, inp.plan_x_m], [y, y], color="#d0d0d0", lw=0.7)
-
-    cx0 = (inp.plan_x_m - inp.core_outer_x_m) / 2.0
-    cy0 = (inp.plan_y_m - inp.core_outer_y_m) / 2.0
-    ax.add_patch(plt.Rectangle((cx0, cy0), inp.core_outer_x_m, inp.core_outer_y_m, fill=False, edgecolor="#007f5f", lw=2.2))
-    ox0 = (inp.plan_x_m - inp.core_opening_x_m) / 2.0
-    oy0 = (inp.plan_y_m - inp.core_opening_y_m) / 2.0
-    ax.add_patch(plt.Rectangle((ox0, oy0), inp.core_opening_x_m, inp.core_opening_y_m, fill=False, edgecolor="#555", lw=1.2, ls="--"))
-
-    # perimeter walls by zone lengths shown using lower zone for plan footprint reference
-    pw = zone_perimeter_wall(inp, "Lower Zone")
-    t = pw.thickness_m
-    sx = (inp.plan_x_m - pw.top_length_m) / 2.0
-    sy = (inp.plan_y_m - pw.left_length_m) / 2.0
-    if pw.top_length_m > 0:
-        ax.add_patch(plt.Rectangle((sx, inp.plan_y_m - t), pw.top_length_m, t, color="#9ecae1", alpha=0.8))
-    if pw.bottom_length_m > 0:
-        ax.add_patch(plt.Rectangle((sx, 0), pw.bottom_length_m, t, color="#9ecae1", alpha=0.8))
-    if pw.left_length_m > 0:
-        ax.add_patch(plt.Rectangle((0, sy), t, pw.left_length_m, color="#9ecae1", alpha=0.8))
-    if pw.right_length_m > 0:
-        ax.add_patch(plt.Rectangle((inp.plan_x_m - t, sy), t, pw.right_length_m, color="#9ecae1", alpha=0.8))
-
-    story = story_for_braces or (res.inp.outrigger_story_levels[0] if res.inp.outrigger_story_levels else None)
-    if story in res.brace_lines_by_story:
-        for line in res.brace_lines_by_story[story]:
-            ax.plot([line.x0, line.x1], [line.y0, line.y1], color="red", lw=2.0)
-
-    ax.set_title(f"Plan view{' - brace story ' + str(story) if story else ''}")
-    ax.set_xlabel("X (m)")
-    ax.set_ylabel("Y (m)")
-    ax.set_aspect("equal")
-    ax.grid(False)
-    return fig
-
-
-def plot_elevation(res: AnalysisResult) -> plt.Figure:
-    inp = res.inp
-    H = total_height(inp)
-    fig, ax = plt.subplots(figsize=(12, 7))
-    ax.plot([0, 0], [0, H], color="black", lw=2)
-    ax.plot([inp.plan_x_m, inp.plan_x_m], [0, H], color="black", lw=2)
-    for i in range(inp.n_story + 1):
-        y = i * inp.story_height_m
-        ax.plot([0, inp.plan_x_m], [y, y], color="#d9d9d9", lw=0.5)
-
-    zone_colors = {"Lower Zone": "#cfe8cf", "Middle Zone": "#fff2ae", "Upper Zone": "#fdd0cf"}
-    for z in res.zones:
-        y0 = (z.story_start - 1) * inp.story_height_m
-        y1 = z.story_end * inp.story_height_m
-        ax.axhspan(y0, y1, color=zone_colors[z.name], alpha=0.35)
-        ax.text(inp.plan_x_m + 0.8, 0.5 * (y0 + y1), f"{z.name}\n{z.story_start}-{z.story_end}", va="center")
-
-    for story in inp.outrigger_story_levels:
-        y = story * inp.story_height_m
-        ax.plot([0, inp.plan_x_m], [y, y], color="red", lw=2.8)
-        ax.text(inp.plan_x_m / 2, y + 0.5, f"Outrigger @ story {story}", color="red", ha="center")
-
-    if inp.n_basement > 0 and inp.retaining_wall.enabled:
-        bh = inp.n_basement * inp.basement_height_m
-        ax.axhspan(-bh, 0, color="#b3cde3", alpha=0.45)
-        ax.text(inp.plan_x_m + 0.8, -bh / 2, "Basement\nretaining wall active", va="center")
-        ax.plot([0, 0], [-bh, 0], color="#1f78b4", lw=5)
-        ax.plot([inp.plan_x_m, inp.plan_x_m], [-bh, 0], color="#1f78b4", lw=5)
-
-    ax.set_xlim(-1, inp.plan_x_m + 12)
-    ax.set_ylim(-inp.n_basement * inp.basement_height_m - 1, H + 2)
-    ax.set_xlabel("Building width reference (m)")
-    ax.set_ylabel("Elevation (m)")
-    ax.set_title("Elevation with zones, basement, and outrigger levels")
-    return fig
-
-
-def plot_mode(res: AnalysisResult, mode_index: int) -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(7, 8))
-    y = np.arange(1, res.inp.n_story + 1)
-    shp = res.modal.mode_shapes[mode_index]
-    ax.plot(shp, y, marker="o")
-    ax.set_title(f"Mode {mode_index + 1} - T = {res.modal.periods_s[mode_index]:.3f} s")
-    ax.set_xlabel("Normalized shape")
+def plot_mode_shape(result: AnalysisResult, mode_index: int) -> plt.Figure:
+    # simple surrogate from displacement envelope for display purposes
+    fig, ax = plt.subplots(figsize=(5, 7))
+    y = result.story_table["Story"].to_numpy()
+    if mode_index == 1:
+        x = y / y.max()
+    elif mode_index == 2:
+        x = np.sin(np.pi * y / y.max())
+    else:
+        x = np.sin(2 * np.pi * y / y.max())
+    ax.plot(x, y)
+    ax.set_xlabel(f"Mode {mode_index} shape (normalized)")
     ax.set_ylabel("Story")
     ax.grid(True, alpha=0.3)
+    ax.set_title(f"Mode {mode_index}")
     return fig
 
 
-def plot_drifts(res: AnalysisResult) -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(7, 8))
-    y = np.arange(1, res.inp.n_story + 1)
-    ax.plot(res.story_drifts_m / res.inp.story_height_m, y, marker="o")
-    ax.axvline(res.inp.drift_limit_ratio, color="red", ls="--", label="limit")
+def plot_drift(result: AnalysisResult) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(5, 7))
+    dr = result.story_table["Disp. (m)"].diff().fillna(result.story_table["Disp. (m)"]).abs() / result.resized_input.story_h
+    ax.plot(dr.to_numpy(), result.story_table["Story"].to_numpy())
+    ax.axvline(result.resized_input.drift_limit, linestyle="--")
     ax.set_xlabel("Story drift ratio")
     ax.set_ylabel("Story")
-    ax.set_title("Story drift ratios")
     ax.grid(True, alpha=0.3)
-    ax.legend()
+    ax.set_title("Story drift ratios")
     return fig
 
 
-# ----------------------------- STREAMLIT UI -----------------------------
-
-def numeric(label: str, value: float, min_value: float, max_value: float, step: float, fmt: Optional[str] = None) -> float:
-    if st is None:
-        return value
-    kwargs = dict(label=label, min_value=min_value, max_value=max_value, value=value, step=step)
-    if fmt is not None:
-        kwargs["format"] = fmt
-    return float(st.sidebar.number_input(**kwargs))
-
-
-def integer(label: str, value: int, min_value: int, max_value: int, step: int = 1) -> int:
-    if st is None:
-        return value
-    return int(st.sidebar.number_input(label, min_value=min_value, max_value=max_value, value=value, step=step))
-
-
-def zone_block(title: str, z: ZoneMemberInput) -> ZoneMemberInput:
-    if st is None:
-        return z
-    with st.sidebar.expander(title, expanded=(title == "Lower Zone")):
-        wall_t = float(st.number_input(f"{title} core wall thickness (m)", 0.20, 1.20, z.wall_thickness_m, 0.01))
-        wall_count = int(st.selectbox(f"{title} core wall count", [4, 6, 8], index=[4, 6, 8].index(z.wall_count)))
-        beam_b = float(st.number_input(f"{title} beam width (m)", 0.25, 0.80, z.beam_width_m, 0.01))
-        beam_h = float(st.number_input(f"{title} beam depth (m)", 0.50, 1.40, z.beam_depth_m, 0.01))
-        slab_t = float(st.number_input(f"{title} slab thickness (m)", 0.15, 0.35, z.slab_thickness_m, 0.01))
-        c1, c2 = st.columns(2)
-        corner_x = float(c1.number_input(f"{title} corner col bx", 0.40, 1.80, z.corner_col_x_m, 0.01))
-        corner_y = float(c2.number_input(f"{title} corner col by", 0.40, 1.80, z.corner_col_y_m, 0.01))
-        c1, c2 = st.columns(2)
-        per_x = float(c1.number_input(f"{title} perimeter col bx", 0.40, 1.60, z.perimeter_col_x_m, 0.01))
-        per_y = float(c2.number_input(f"{title} perimeter col by", 0.40, 1.60, z.perimeter_col_y_m, 0.01))
-        c1, c2 = st.columns(2)
-        in_x = float(c1.number_input(f"{title} interior col bx", 0.40, 1.40, z.interior_col_x_m, 0.01))
-        in_y = float(c2.number_input(f"{title} interior col by", 0.40, 1.40, z.interior_col_y_m, 0.01))
-    return ZoneMemberInput(wall_t, beam_b, beam_h, slab_t, corner_x, corner_y, per_x, per_y, in_x, in_y, wall_count)
+def plot_plan(inp: BuildingInput, result: AnalysisResult) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(8, 7))
+    ax.plot([0, inp.plan_x, inp.plan_x, 0, 0], [0, 0, inp.plan_y, inp.plan_y, 0], color="black")
+    for i in range(inp.n_bays_x + 1):
+        x = i * inp.bay_x
+        ax.plot([x, x], [0, inp.plan_y], color="lightgray", linewidth=0.7)
+    for j in range(inp.n_bays_y + 1):
+        y = j * inp.bay_y
+        ax.plot([0, inp.plan_x], [y, y], color="lightgray", linewidth=0.7)
+    cx0 = (inp.plan_x - inp.core_outer_x) / 2.0
+    cy0 = (inp.plan_y - inp.core_outer_y) / 2.0
+    ax.add_patch(plt.Rectangle((cx0, cy0), inp.core_outer_x, inp.core_outer_y, fill=False, linewidth=2))
+    ix0 = (inp.plan_x - inp.core_open_x) / 2.0
+    iy0 = (inp.plan_y - inp.core_open_y) / 2.0
+    ax.add_patch(plt.Rectangle((ix0, iy0), inp.core_open_x, inp.core_open_y, fill=False, linestyle="--"))
+    if inp.retaining_enabled:
+        ax.add_patch(plt.Rectangle((0, 0), inp.plan_x, inp.plan_y, fill=False, linewidth=1.0, linestyle=':'))
+    # core to perimeter lines, shown once as layout concept
+    center_x = inp.plan_x / 2.0
+    center_y = inp.plan_y / 2.0
+    ax.plot([cx0, 0], [center_y, center_y], linewidth=2)
+    ax.plot([cx0 + inp.core_outer_x, inp.plan_x], [center_y, center_y], linewidth=2)
+    ax.plot([center_x, center_x], [cy0, 0], linewidth=2)
+    ax.plot([center_x, center_x], [cy0 + inp.core_outer_y, inp.plan_y], linewidth=2)
+    ax.set_aspect("equal")
+    ax.set_title("Plan: core, grids, perimeter, and outrigger layout concept")
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    return fig
 
 
-def perimeter_wall_block(title: str, p: PerimeterWallInput, plan_x: float, plan_y: float) -> PerimeterWallInput:
-    if st is None:
-        return p
-    with st.sidebar.expander(title, expanded=False):
-        t = float(st.number_input(f"{title} thickness (m)", 0.15, 0.60, p.thickness_m, 0.01))
-        top = float(st.number_input(f"{title} top length (m)", 0.0, plan_x, p.top_length_m, 0.5))
-        bottom = float(st.number_input(f"{title} bottom length (m)", 0.0, plan_x, p.bottom_length_m, 0.5))
-        left = float(st.number_input(f"{title} left length (m)", 0.0, plan_y, p.left_length_m, 0.5))
-        right = float(st.number_input(f"{title} right length (m)", 0.0, plan_y, p.right_length_m, 0.5))
-    return PerimeterWallInput(t, top, bottom, left, right)
+def plot_elevation(inp: BuildingInput, result: AnalysisResult) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(8, 7))
+    H = inp.n_story * inp.story_h
+    ax.plot([0, 0], [0, H], color="black")
+    ax.plot([inp.plan_x * 0.2, inp.plan_x * 0.2], [0, H], color="black")
+    for s in range(inp.n_story + 1):
+        y = s * inp.story_h
+        ax.plot([0, inp.plan_x * 0.2], [y, y], color="lightgray", linewidth=0.6)
+    for lv in result.brace_levels:
+        y = lv * inp.story_h
+        ax.plot([0, inp.plan_x * 0.2], [y, y], color="red", linewidth=2)
+    for z in define_zones(inp.n_story):
+        y = z.story_end * inp.story_h
+        ax.text(inp.plan_x * 0.22, y, f"{z.name}: {z.story_start}-{z.story_end}")
+    ax.set_title("Elevation: outrigger levels and zones")
+    ax.set_xlabel("Structural width (schematic)")
+    ax.set_ylabel("Height (m)")
+    return fig
 
 
-def streamlit_input_panel() -> BuildingInput:
+def input_sidebar() -> BuildingInput:
+    st.sidebar.header("Inputs")
     default = BuildingInput()
-    if st is None:
-        return default
-
-    st.sidebar.header("Input Data")
-    n_story = integer("Above-grade stories", default.n_story, 10, 120)
-    n_basement = integer("Basement stories", default.n_basement, 0, 10)
-    story_h = numeric("Story height (m)", default.story_height_m, 2.8, 5.0, 0.1)
-    base_h = numeric("Basement height (m)", default.basement_height_m, 2.8, 5.0, 0.1)
-    plan_x = numeric("Plan X (m)", default.plan_x_m, 20.0, 120.0, 1.0)
-    plan_y = numeric("Plan Y (m)", default.plan_y_m, 20.0, 120.0, 1.0)
-    bays_x = integer("Bays in X", default.n_bays_x, 3, 12)
-    bays_y = integer("Bays in Y", default.n_bays_y, 3, 12)
-    bay_x = numeric("Bay X (m)", default.bay_x_m, 5.0, 12.0, 0.5)
-    bay_y = numeric("Bay Y (m)", default.bay_y_m, 5.0, 12.0, 0.5)
+    n_story = st.sidebar.number_input("Stories", 10, 100, default.n_story)
+    n_basement = st.sidebar.number_input("Basements", 0, 10, default.n_basement)
+    story_h = st.sidebar.number_input("Story height (m)", 2.8, 5.0, default.story_h)
+    plan_x = st.sidebar.number_input("Plan X (m)", 20.0, 100.0, default.plan_x)
+    plan_y = st.sidebar.number_input("Plan Y (m)", 20.0, 100.0, default.plan_y)
+    n_bays_x = st.sidebar.number_input("Bays X", 3, 12, default.n_bays_x)
+    n_bays_y = st.sidebar.number_input("Bays Y", 3, 12, default.n_bays_y)
+    bay_x = st.sidebar.number_input("Bay X (m)", 5.0, 12.0, default.bay_x)
+    bay_y = st.sidebar.number_input("Bay Y (m)", 5.0, 12.0, default.bay_y)
 
     st.sidebar.subheader("Core")
-    core_outer_x = numeric("Core outer X (m)", default.core_outer_x_m, 8.0, plan_x - 6.0, 0.5)
-    core_outer_y = numeric("Core outer Y (m)", default.core_outer_y_m, 8.0, plan_y - 6.0, 0.5)
-    core_open_x = numeric("Core opening X (m)", default.core_opening_x_m, 4.0, core_outer_x - 2.0, 0.5)
-    core_open_y = numeric("Core opening Y (m)", default.core_opening_y_m, 4.0, core_outer_y - 2.0, 0.5)
+    core_outer_x = st.sidebar.number_input("Core outer X (m)", 8.0, 30.0, default.core_outer_x)
+    core_outer_y = st.sidebar.number_input("Core outer Y (m)", 8.0, 30.0, default.core_outer_y)
+    core_open_x = st.sidebar.number_input("Core opening X (m)", 4.0, 24.0, default.core_open_x)
+    core_open_y = st.sidebar.number_input("Core opening Y (m)", 4.0, 24.0, default.core_open_y)
 
-    st.sidebar.subheader("Materials / cracked factors")
-    Ec = numeric("Ec (MPa)", default.Ec_mpa, 25000.0, 45000.0, 500.0)
-    wall_cf = numeric("Core wall cracked factor", default.wall_cracked_factor, 0.20, 1.0, 0.05)
-    pwall_cf = numeric("Perimeter wall cracked factor", default.perimeter_wall_cracked_factor, 0.20, 1.0, 0.05)
-    col_cf = numeric("Column cracked factor", default.column_cracked_factor, 0.30, 1.0, 0.05)
-    beam_cf = numeric("Beam cracked factor", default.beam_cracked_factor, 0.20, 1.0, 0.05)
+    st.sidebar.subheader("Cracked stiffness")
+    wall_cr = st.sidebar.number_input("Core wall factor", 0.2, 1.0, default.wall_cr, 0.05)
+    perimeter_wall_cr = st.sidebar.number_input("Perimeter wall factor", 0.2, 1.0, default.perimeter_wall_cr, 0.05)
+    beam_cr = st.sidebar.number_input("Beam factor", 0.2, 1.0, default.beam_cr, 0.05)
+    col_cr = st.sidebar.number_input("Column factor", 0.2, 1.0, default.col_cr, 0.05)
+    slab_cr = st.sidebar.number_input("Slab factor", 0.1, 1.0, default.slab_cr, 0.05)
 
-    st.sidebar.subheader("Loads")
-    sdl = numeric("Super dead load (kPa)", default.super_dead_load_kpa, 1.0, 10.0, 0.1)
-    ll = numeric("Live load (kPa)", default.live_load_kpa, 0.5, 6.0, 0.1)
-    facade = numeric("Facade line load (kN/m)", default.facade_line_load_kn_m, 2.0, 25.0, 0.5)
+    st.sidebar.subheader("Seismic / code")
+    drift_limit = st.sidebar.number_input("Drift limit", 0.001, 0.01, default.drift_limit, 0.0005, format="%.4f")
+    seismic_coeff = st.sidebar.number_input("Seismic coeff.", 0.005, 0.08, default.seismic_coeff, 0.0025)
+    Ct = st.sidebar.number_input("Ct", 0.01, 0.12, default.Ct, 0.001)
+    x_exp = st.sidebar.number_input("x exponent", 0.5, 1.0, default.x_exp, 0.01)
+    Cu = st.sidebar.number_input("Cu", 1.0, 2.0, default.Cu, 0.05)
 
-    lower_zone = zone_block("Lower Zone", default.lower_zone)
-    middle_zone = zone_block("Middle Zone", default.middle_zone)
-    upper_zone = zone_block("Upper Zone", default.upper_zone)
+    st.sidebar.subheader("Outrigger CHS")
+    n_outrigger_levels = st.sidebar.number_input("Outrigger levels", 0, 3, default.brace.n_outrigger_levels)
+    outer_diameter_mm = st.sidebar.number_input("CHS OD (mm)", 200.0, 1000.0, default.brace.outer_diameter_mm)
+    thickness_mm = st.sidebar.number_input("CHS thickness (mm)", 8.0, 50.0, default.brace.thickness_mm)
+    k_factor = st.sidebar.number_input("K factor", 0.5, 2.0, default.brace.k_factor, 0.05)
+    buckling_reduction = st.sidebar.number_input("Buckling reduction", 0.3, 1.0, default.brace.buckling_reduction, 0.05)
 
-    lower_pw = perimeter_wall_block("Lower perimeter wall", default.lower_perimeter_wall, plan_x, plan_y)
-    middle_pw = perimeter_wall_block("Middle perimeter wall", default.middle_perimeter_wall, plan_x, plan_y)
-    upper_pw = perimeter_wall_block("Upper perimeter wall", default.upper_perimeter_wall, plan_x, plan_y)
-
-    st.sidebar.subheader("Basement retaining wall")
-    rw_enabled = st.sidebar.checkbox("Retaining wall active", value=default.retaining_wall.enabled)
-    rw_t = numeric("Retaining wall thickness (m)", default.retaining_wall.thickness_m, 0.25, 0.80, 0.01)
-    rw_red = numeric("Retaining wall stiffness reduction", default.retaining_wall.stiffness_reduction, 0.02, 0.40, 0.01)
-
-    st.sidebar.subheader("Outrigger")
-    og_count = integer("Number of outrigger levels", len(default.outrigger_story_levels), 0, 4)
-    og_levels = []
-    suggested = [max(5, int(round(n_story * 0.4))), max(8, int(round(n_story * 0.7))), max(10, int(round(n_story * 0.85))), max(12, int(round(n_story * 0.93)))]
-    for i in range(og_count):
-        og_levels.append(integer(f"Outrigger level {i+1}", min(suggested[i], n_story), 1, n_story))
-    od = numeric("Brace CHS OD (mm)", default.brace_input.outer_diameter_mm, 168.0, 610.0, 1.0)
-    tt = numeric("Brace CHS thickness (mm)", default.brace_input.thickness_mm, 8.0, 40.0, 1.0)
-    kf = numeric("Brace K factor", default.brace_input.k_factor, 0.7, 1.5, 0.05)
-    br_red = numeric("Brace buckling reduction", default.brace_input.buckling_reduction, 0.4, 1.0, 0.05)
-
-    st.sidebar.subheader("Code checks")
-    drift_lim = numeric("Story drift limit ratio", default.drift_limit_ratio, 1/1000, 1/250, 1/1000, fmt="%.5f")
-    Ct = numeric("Ct", default.Ct, 0.02, 0.10, 0.001, fmt="%.4f")
-    xexp = numeric("x exponent", default.x_exp, 0.50, 1.00, 0.01, fmt="%.2f")
-    Cu = numeric("Cu", default.Cu, 1.0, 2.0, 0.05, fmt="%.2f")
-    auto_size_flag = st.sidebar.checkbox("Auto-size using drift + code ceiling", value=True)
+    st.sidebar.subheader("Retaining wall")
+    retaining_enabled = st.sidebar.checkbox("Retaining enabled", value=default.retaining_enabled)
+    retaining_t = st.sidebar.number_input("Retaining wall t (m)", 0.2, 1.0, default.retaining_t)
+    retaining_reduction = st.sidebar.number_input("Retaining reduction", 0.0, 0.20, default.retaining_reduction, 0.01)
 
     return BuildingInput(
-        n_story=n_story,
-        n_basement=n_basement,
-        story_height_m=story_h,
-        basement_height_m=base_h,
-        plan_x_m=plan_x,
-        plan_y_m=plan_y,
-        n_bays_x=bays_x,
-        n_bays_y=bays_y,
-        bay_x_m=bay_x,
-        bay_y_m=bay_y,
-        core_outer_x_m=core_outer_x,
-        core_outer_y_m=core_outer_y,
-        core_opening_x_m=core_open_x,
-        core_opening_y_m=core_open_y,
-        Ec_mpa=Ec,
-        wall_cracked_factor=wall_cf,
-        perimeter_wall_cracked_factor=pwall_cf,
-        column_cracked_factor=col_cf,
-        beam_cracked_factor=beam_cf,
-        super_dead_load_kpa=sdl,
-        live_load_kpa=ll,
-        facade_line_load_kn_m=facade,
-        lower_zone=lower_zone,
-        middle_zone=middle_zone,
-        upper_zone=upper_zone,
-        lower_perimeter_wall=lower_pw,
-        middle_perimeter_wall=middle_pw,
-        upper_perimeter_wall=upper_pw,
-        retaining_wall=RetainingWallInput(enabled=rw_enabled, thickness_m=rw_t, stiffness_reduction=rw_red),
-        outrigger_story_levels=og_levels,
-        brace_input=BraceInput(outer_diameter_mm=od, thickness_mm=tt, k_factor=kf, buckling_reduction=br_red),
-        drift_limit_ratio=drift_lim,
-        Ct=Ct,
-        x_exp=xexp,
-        Cu=Cu,
-        auto_size=auto_size_flag,
+        n_story=int(n_story),
+        n_basement=int(n_basement),
+        story_h=float(story_h),
+        basement_h=default.basement_h,
+        plan_x=float(plan_x),
+        plan_y=float(plan_y),
+        n_bays_x=int(n_bays_x),
+        n_bays_y=int(n_bays_y),
+        bay_x=float(bay_x),
+        bay_y=float(bay_y),
+        core_outer_x=float(core_outer_x),
+        core_outer_y=float(core_outer_y),
+        core_open_x=float(core_open_x),
+        core_open_y=float(core_open_y),
+        wall_cr=float(wall_cr),
+        perimeter_wall_cr=float(perimeter_wall_cr),
+        beam_cr=float(beam_cr),
+        col_cr=float(col_cr),
+        slab_cr=float(slab_cr),
+        drift_limit=float(drift_limit),
+        seismic_coeff=float(seismic_coeff),
+        Ct=float(Ct),
+        x_exp=float(x_exp),
+        Cu=float(Cu),
+        retaining_enabled=bool(retaining_enabled),
+        retaining_t=float(retaining_t),
+        retaining_reduction=float(retaining_reduction),
+        brace=BraceSystem(
+            n_outrigger_levels=int(n_outrigger_levels),
+            outer_diameter_mm=float(outer_diameter_mm),
+            thickness_mm=float(thickness_mm),
+            k_factor=float(k_factor),
+            buckling_reduction=float(buckling_reduction),
+        ),
     )
 
 
-def main() -> None:
-    if st is None:
-        raise SystemExit("Streamlit is required to run the app UI.")
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(APP_TITLE)
-    st.caption(APP_VERSION)
-    st.info("No manual target period and no manual brace count input. Outrigger layout is generated automatically from core-to-perimeter geometry. Auto-sizing uses only drift limit and code period ceiling.")
+def compare_summary(no_brace: AnalysisResult, with_brace: AnalysisResult) -> pd.DataFrame:
+    rows = []
+    items = [
+        ("T1 (s)", no_brace.periods[0], with_brace.periods[0]),
+        ("Roof disp. (m)", no_brace.roof_disp_m, with_brace.roof_disp_m),
+        ("Max drift ratio", no_brace.max_story_drift_ratio, with_brace.max_story_drift_ratio),
+        ("Core wall lower (m)", no_brace.resized_input.lower.wall_t, with_brace.resized_input.lower.wall_t),
+        ("Beam h lower (m)", no_brace.resized_input.lower.beam_h, with_brace.resized_input.lower.beam_h),
+        ("Corner col lower x (m)", no_brace.resized_input.lower.corner_col_x, with_brace.resized_input.lower.corner_col_x),
+    ]
+    for label, a, b in items:
+        rows.append({"Metric": label, "No outriggers": a, "With outriggers": b, "Delta": b - a, "Delta %": 100*(b-a)/a if abs(a)>1e-9 else np.nan})
+    return pd.DataFrame(rows)
 
-    inp = streamlit_input_panel()
-    if st.button("Analyze") or "analysis_result" not in st.session_state:
-        st.session_state.analysis_result = analyze(inp)
-    res: AnalysisResult = st.session_state.analysis_result
 
-    tabs = st.tabs(["Summary", "Zones", "Stories", "Outriggers", "Plan", "Elevation", "Modes", "Drifts"])
+def main():
+    st.set_page_config(page_title="Outrigger Stage 4", layout="wide")
+    st.title("Stage 4 — Comparison + system forces")
+    st.caption("Approximate MDOF preliminary design tool. Use for calibration, not as a substitute for ETABS.")
+
+    inp = input_sidebar()
+    if st.button("Analyze"):
+        with st.spinner("Running analyses..."):
+            no_brace_inp = replace(inp, brace=replace(inp.brace, n_outrigger_levels=0))
+            res_no = analyze(no_brace_inp)
+            res_yes = analyze(inp)
+            st.session_state["res_no"] = res_no
+            st.session_state["res_yes"] = res_yes
+
+    if "res_yes" not in st.session_state:
+        st.info("Set inputs and click Analyze.")
+        return
+
+    res_no: AnalysisResult = st.session_state["res_no"]
+    res_yes: AnalysisResult = st.session_state["res_yes"]
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("T1 no-outrigger (s)", f"{res_no.periods[0]:.3f}")
+    c2.metric("T1 with-outrigger (s)", f"{res_yes.periods[0]:.3f}")
+    c3.metric("Roof disp. with-outrigger (m)", f"{res_yes.roof_disp_m:.3f}")
+    c4.metric("Max drift ratio with-outrigger", f"{res_yes.max_story_drift_ratio:.5f}")
+
+    tabs = st.tabs(["Comparison", "With outriggers", "Without outriggers", "Plan / Elevation", "Modes / Drift"])
 
     with tabs[0]:
-        st.dataframe(summary_df(res), use_container_width=True)
+        st.subheader("Global comparison")
+        st.dataframe(compare_summary(res_no, res_yes), use_container_width=True)
+        st.subheader("System shear split — with outriggers")
+        st.dataframe(res_yes.system_force_table, use_container_width=True)
+        st.subheader("Approximate outrigger forces")
+        st.dataframe(res_yes.brace_force_table, use_container_width=True)
+
     with tabs[1]:
-        st.dataframe(zones_df(res), use_container_width=True)
+        st.subheader("Zone table — with outriggers")
+        st.dataframe(res_yes.zone_table, use_container_width=True)
+        st.subheader("Stiffness contributions — with outriggers")
+        st.dataframe(res_yes.contribution_table, use_container_width=True)
+        st.subheader("Story table — with outriggers")
+        st.dataframe(res_yes.story_table, use_container_width=True, height=500)
+        st.subheader("Sizing iterations")
+        st.dataframe(res_yes.iteration_log, use_container_width=True)
+
     with tabs[2]:
-        st.dataframe(stories_df(res), use_container_width=True, height=520)
+        st.subheader("Zone table — without outriggers")
+        st.dataframe(res_no.zone_table, use_container_width=True)
+        st.subheader("Stiffness contributions — without outriggers")
+        st.dataframe(res_no.contribution_table, use_container_width=True)
+        st.subheader("Story table — without outriggers")
+        st.dataframe(res_no.story_table, use_container_width=True, height=500)
+
     with tabs[3]:
-        st.dataframe(outriggers_df(res), use_container_width=True)
+        st.pyplot(plot_plan(inp, res_yes))
+        st.pyplot(plot_elevation(inp, res_yes))
+
     with tabs[4]:
-        story_choice = st.selectbox("Show brace layout for story", options=res.inp.outrigger_story_levels if res.inp.outrigger_story_levels else [0])
-        st.pyplot(plot_plan(res, story_choice if story_choice != 0 else None))
-    with tabs[5]:
-        st.pyplot(plot_elevation(res))
-    with tabs[6]:
-        mode_id = st.selectbox("Mode", options=list(range(1, min(5, len(res.modal.periods_s)) + 1)))
-        st.pyplot(plot_mode(res, mode_id - 1))
-    with tabs[7]:
-        st.dataframe(drifts_df(res), use_container_width=True, height=520)
-        st.pyplot(plot_drifts(res))
+        mode = st.selectbox("Mode", [1, 2, 3], index=0)
+        st.pyplot(plot_mode_shape(res_yes, mode))
+        st.pyplot(plot_drift(res_yes))
 
 
 if __name__ == "__main__":
