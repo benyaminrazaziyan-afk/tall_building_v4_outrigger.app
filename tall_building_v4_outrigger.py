@@ -1,7 +1,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import pi, sqrt
 from typing import List, Optional
 
@@ -73,9 +73,9 @@ class BuildingInput:
     beam_width_m: float = 0.45
     beam_depth_m: float = 0.80
 
-    lower_zone: ZoneMemberInput = ZoneMemberInput(0.60, 1.20, 1.20, 1.00, 1.00, 0.90, 0.90)
-    middle_zone: ZoneMemberInput = ZoneMemberInput(0.45, 1.00, 1.00, 0.85, 0.85, 0.75, 0.75)
-    upper_zone: ZoneMemberInput = ZoneMemberInput(0.35, 0.85, 0.85, 0.75, 0.75, 0.65, 0.65)
+    lower_zone: ZoneMemberInput = field(default_factory=lambda: ZoneMemberInput(0.60, 1.20, 1.20, 1.00, 1.00, 0.90, 0.90))
+    middle_zone: ZoneMemberInput = field(default_factory=lambda: ZoneMemberInput(0.45, 1.00, 1.00, 0.85, 0.85, 0.75, 0.75))
+    upper_zone: ZoneMemberInput = field(default_factory=lambda: ZoneMemberInput(0.35, 0.85, 0.85, 0.75, 0.75, 0.65, 0.65))
 
     stair_count: int = 2
     elevator_count: int = 4
