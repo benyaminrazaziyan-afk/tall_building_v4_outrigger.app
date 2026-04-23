@@ -25,7 +25,6 @@ except Exception:
 
 
 # ===== Embedded MDOF Framework =====
-from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from math import pi, sqrt
@@ -754,7 +753,6 @@ def example_usage():
 
 # ===== Streamlit App =====
 
-from __future__ import annotations
 
 from dataclasses import asdict
 from pathlib import Path
