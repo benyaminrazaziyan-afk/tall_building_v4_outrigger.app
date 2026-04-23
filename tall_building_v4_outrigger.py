@@ -1,6 +1,6 @@
 from textwrap import dedent
 
-code = dedent(r'''
+streamlit_code = dedent(r'''
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -10,11 +10,17 @@ from typing import List, Tuple, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import streamlit as st
 
 
 G = 9.81
 STEEL_DENSITY = 7850.0
 
+APP_TITLE = "Tall Building Preliminary Design + Outrigger Belt Truss"
+APP_VERSION = "v5.0-clean-streamlit"
+
+
+# ----------------------------- DATA MODELS -----------------------------
 
 @dataclass
 class ZoneDefinition:
@@ -151,11 +157,11 @@ class DesignResult:
 
 @dataclass
 class BuildingInput:
-    plan_shape: str = "rectangular"
-    n_story: int = 50
+    plan_shape: str = "square"
+    n_story: int = 60
     n_basement: int = 10
     story_height: float = 3.2
-    basement_height: float = 3.5
+    basement_height: float = 3.0
     plan_x: float = 80.0
     plan_y: float = 80.0
     n_bays_x: int = 8
@@ -193,7 +199,6 @@ class BuildingInput:
 
     wall_cracked_factor: float = 0.40
     column_cracked_factor: float = 0.70
-    max_story_wall_slenderness: float = 12.0
 
     wall_rebar_ratio: float = 0.003
     column_rebar_ratio: float = 0.010
@@ -217,18 +222,22 @@ class BuildingInput:
     perimeter_shear_wall_ratio: float = 0.20
 
     outrigger_count: int = 2
-    outrigger_story_levels: List[int] = field(default_factory=lambda: [25, 40])
+    outrigger_story_levels: List[int] = field(default_factory=lambda: [30, 45])
     outrigger_truss_depth_m: float = 3.0
     outrigger_chord_area_m2: float = 0.08
     outrigger_diagonal_area_m2: float = 0.04
 
+
+# ----------------------------- ENGINE -----------------------------
 
 def total_height(inp: BuildingInput) -> float:
     return inp.n_story * inp.story_height
 
 
 def floor_area(inp: BuildingInput) -> float:
-    return 0.5 * inp.plan_x * inp.plan_y if inp.plan_shape == "triangle" else inp.plan_x * inp.plan_y
+    if inp.plan_shape == "triangle":
+        return 0.5 * inp.plan_x * inp.plan_y
+    return inp.plan_x * inp.plan_y
 
 
 def code_type_period(H: float, Ct: float, x_period: float) -> float:
@@ -354,7 +363,7 @@ def perimeter_wall_segments_for_square(inp: BuildingInput, zone: ZoneDefinition)
 def wall_thickness_by_zone(inp: BuildingInput, H: float, zone: ZoneDefinition, core_scale: float) -> float:
     base_t = max(inp.min_wall_thickness, min(inp.max_wall_thickness, H / 180.0))
     zone_factor = {"Lower Zone": 1.00, "Middle Zone": 0.80, "Upper Zone": 0.60}[zone.name]
-    t = base_t * core_scale * zone_factor
+    t = base_t * zone_factor * core_scale
     return max(inp.min_wall_thickness, min(inp.max_wall_thickness, t))
 
 
@@ -412,8 +421,8 @@ def calculate_outrigger_stiffness(inp: BuildingInput, story_level: int, truss_de
         truss_width_m=truss_width,
         chord_area_m2=chord_area,
         diagonal_area_m2=diagonal_area,
-        axial_stiffness_kN=axial_stiffness / 1000,
-        equivalent_spring_kN_m=stiffness_contribution / 1000,
+        axial_stiffness_kN=axial_stiffness / 1000.0,
+        equivalent_spring_kN_m=stiffness_contribution / 1000.0,
         stiffness_contribution=stiffness_contribution,
         K_rotational_Nm_per_rad=K_rot,
         effective_I_addition_m4=effective_I_addition,
@@ -426,14 +435,19 @@ def calculate_total_outrigger_stiffness(inp: BuildingInput) -> tuple[List[Outrig
 
     outriggers = []
     total_K = 0.0
+
     for level in inp.outrigger_story_levels[:inp.outrigger_count]:
         if 1 <= level <= inp.n_story:
-            or_result = calculate_outrigger_stiffness(
-                inp, level, inp.outrigger_truss_depth_m,
-                inp.outrigger_chord_area_m2, inp.outrigger_diagonal_area_m2
+            item = calculate_outrigger_stiffness(
+                inp,
+                level,
+                inp.outrigger_truss_depth_m,
+                inp.outrigger_chord_area_m2,
+                inp.outrigger_diagonal_area_m2,
             )
-            outriggers.append(or_result)
-            total_K += or_result.stiffness_contribution
+            outriggers.append(item)
+            total_K += item.stiffness_contribution
+
     return outriggers, total_K
 
 
@@ -706,9 +720,11 @@ def solve_mdof_modes(inp: BuildingInput, total_weight_kN_value: float, K_total: 
     eigvals, eigvecs = np.linalg.eig(A)
     eigvals = np.real(eigvals)
     eigvecs = np.real(eigvecs)
+
     pos = eigvals > 1e-12
     eigvals = eigvals[pos]
     eigvecs = eigvecs[:, pos]
+
     order = np.argsort(eigvals)
     eigvals = eigvals[order]
     eigvecs = eigvecs[:, order]
@@ -719,6 +735,7 @@ def solve_mdof_modes(inp: BuildingInput, total_weight_kN_value: float, K_total: 
 
     ones = np.ones((len(masses), 1))
     total_mass = np.sum(np.diag(M)).item()
+
     mass_ratios = []
     cumulative = []
     mode_shapes = []
@@ -759,10 +776,10 @@ def generate_redesign_suggestions(inp: BuildingInput, T_est: float, T_target: fl
     if T_est > T_limit:
         governing_issue = "Period exceeds upper limit"
         suggestions.extend([
-            "Increase lateral stiffness by enlarging core walls and/or perimeter columns.",
+            "Increase lateral stiffness by enlarging core walls and perimeter columns.",
             "Increase active wall count in middle and upper zones.",
             "Consider larger core footprint if architecture permits.",
-            "Add or strengthen outrigger belt trusses.",
+            "Add or strengthen outriggers.",
         ])
     elif T_est > 1.10 * T_target:
         governing_issue = "Period above target"
@@ -782,9 +799,9 @@ def generate_redesign_suggestions(inp: BuildingInput, T_est: float, T_target: fl
     if drift_ratio > drift_limit:
         governing_issue = "Drift exceeds allowable limit"
         suggestions.extend([
-            "Increase global stiffness by enlarging the core and perimeter columns.",
+            "Increase global stiffness by enlarging core and perimeter columns.",
             "Increase wall ratio or add perimeter wall segments.",
-            "Add outrigger belt trusses to control drift.",
+            "Add outriggers to control drift.",
         ])
 
     if core_scale >= 1.55:
@@ -793,6 +810,7 @@ def generate_redesign_suggestions(inp: BuildingInput, T_est: float, T_target: fl
         suggestions.append("Column scale factor is near its upper bound.")
     if not suggestions:
         suggestions.append("Structural system appears preliminarily adequate.")
+
     return governing_issue, suggestions
 
 
@@ -854,6 +872,7 @@ def run_iterative_design(inp: BuildingInput) -> DesignResult:
     core_scale = 1.0
     column_scale = 1.0
     iteration_history: List[IterationLog] = []
+
     best_result = None
     best_error = float("inf")
 
@@ -872,7 +891,7 @@ def run_iterative_design(inp: BuildingInput) -> DesignResult:
         K_total = ev["K_est"]
 
         error = abs(T_est - T_target) / T_target
-        error_percent = error * 100
+        error_percent = error * 100.0
 
         iteration_history.append(
             IterationLog(
@@ -900,11 +919,11 @@ def run_iterative_design(inp: BuildingInput) -> DesignResult:
 
         stiffness_ratio = (T_est / T_target) ** 2
         structural_K = K_core + K_cols
-        core_stiffness_share = K_core / structural_K if structural_K > 0 else 0.7
+        core_share = K_core / structural_K if structural_K > 0 else 0.7
         damping = 0.65
 
-        scale_factor_core = stiffness_ratio ** (core_stiffness_share / 3.0)
-        scale_factor_col = stiffness_ratio ** ((1.0 - core_stiffness_share) / 4.0)
+        scale_factor_core = stiffness_ratio ** (core_share / 3.0)
+        scale_factor_col = stiffness_ratio ** ((1.0 - core_share) / 4.0)
 
         new_core_scale = core_scale + damping * (core_scale * scale_factor_core - core_scale)
         new_column_scale = column_scale + damping * (column_scale * scale_factor_col - column_scale)
@@ -915,7 +934,7 @@ def run_iterative_design(inp: BuildingInput) -> DesignResult:
         scale_change = abs(new_core_scale - core_scale) + abs(new_column_scale - column_scale)
         if scale_change < 0.002 and iteration > 3:
             if error > tolerance:
-                if core_stiffness_share > 0.5:
+                if core_share > 0.5:
                     new_core_scale = max(MIN_SCALE, core_scale * 0.95)
                 else:
                     new_column_scale = max(MIN_SCALE, column_scale * 0.95)
@@ -949,20 +968,12 @@ def run_iterative_design(inp: BuildingInput) -> DesignResult:
         f"T_target = {T_target:.3f} s",
         f"Final T_est (MDOF) = {T_est:.3f} s",
         f"Iterations used = {len(iteration_history)}",
-        f"MDOF Mode 1 mass participation = {100*ev['modal'].effective_mass_ratios[0]:.1f}%",
+        f"Mode 1 effective mass = {100 * ev['modal'].effective_mass_ratios[0]:.1f}%",
     ]
 
     if ev["outriggers"]:
         messages.append(f"Outrigger count = {len(ev['outriggers'])}")
         messages.append(f"Outrigger stiffness contribution = {ev['K_outrigger']:.2e} N/m")
-        for or_result in ev["outriggers"]:
-            messages.append(
-                f"Outrigger at story {or_result.story_level} (h={or_result.height_m:.1f} m): "
-                f"K = {or_result.stiffness_contribution:.2e} N/m"
-            )
-
-    messages.append(f"Upper period check = {'OK' if period_ok else 'NOT OK'}")
-    messages.append(f"Drift check = {'OK' if drift_ok else 'NOT OK'}")
 
     return DesignResult(
         H_m=total_height(inp),
@@ -1002,10 +1013,12 @@ def run_design(inp: BuildingInput) -> DesignResult:
     return run_iterative_design(inp)
 
 
+# ----------------------------- REPORTS / TABLES -----------------------------
+
 def build_report(result: DesignResult) -> str:
     lines = []
     lines.append("=" * 74)
-    lines.append("TALL BUILDING PRELIMINARY DESIGN REPORT - CLEAN JUPYTER VERSION")
+    lines.append(f"{APP_TITLE} - {APP_VERSION}")
     lines.append("=" * 74)
     lines.append("")
     lines.append("GLOBAL RESPONSE")
@@ -1030,7 +1043,11 @@ def build_report(result: DesignResult) -> str:
     lines.append("-" * 74)
     if result.outrigger_results:
         for o in result.outrigger_results:
-            lines.append(f"Story {o.story_level:>3} | h = {o.height_m:>6.1f} m | K = {o.stiffness_contribution:>10.3e} N/m")
+            lines.append(
+                f"Story {o.story_level:>3} | h = {o.height_m:>6.1f} m | "
+                f"K = {o.stiffness_contribution:>10.3e} N/m | "
+                f"Krot = {o.K_rotational_Nm_per_rad:>10.3e} Nm/rad"
+            )
     else:
         lines.append("No outriggers defined.")
     lines.append("")
@@ -1062,7 +1079,7 @@ def build_report(result: DesignResult) -> str:
 def result_summary_table(result: DesignResult) -> pd.DataFrame:
     return pd.DataFrame({
         "Parameter": [
-            "H (m)", "Floor Area (m2)", "Weight (kN)", "T_ref (s)", "T_target (s)", "T_est (s)",
+            "H (m)", "Floor Area (m²)", "Weight (kN)", "T_ref (s)", "T_target (s)", "T_est (s)",
             "T_upper (s)", "Drift (m)", "Drift Ratio", "Beam b (m)", "Beam h (m)", "Slab t (m)"
         ],
         "Value": [
@@ -1089,6 +1106,8 @@ def iteration_table(result: DesignResult) -> pd.DataFrame:
     } for it in result.iteration_history])
 
 
+# ----------------------------- PLOTS -----------------------------
+
 def plot_mode_shapes(result: DesignResult, modes: int = 3) -> plt.Figure:
     modal = result.modal_result
     if modal is None:
@@ -1096,8 +1115,10 @@ def plot_mode_shapes(result: DesignResult, modes: int = 3) -> plt.Figure:
 
     fig, ax = plt.subplots(figsize=(7, 8))
     y = np.arange(1, modal.n_dof + 1)
+
     for i in range(min(modes, len(modal.mode_shapes))):
         ax.plot(modal.mode_shapes[i], y, marker="o", label=f"Mode {i+1} | T={modal.periods_s[i]:.3f}s")
+
     ax.set_xlabel("Normalized mode shape")
     ax.set_ylabel("Story")
     ax.set_title("Mode shapes")
@@ -1174,10 +1195,10 @@ def plot_plan(result: DesignResult, inp: BuildingInput, zone_name: str = "Lower 
             center_x = inp.plan_x / 2
             center_y = inp.plan_y / 2
             for x, y, w, h in [
-                (cx0 - arm, center_y - dep/2, arm, dep),
-                (cx1, center_y - dep/2, arm, dep),
-                (center_x - dep/2, cy0 - arm, dep, arm),
-                (center_x - dep/2, cy1, dep, arm),
+                (cx0 - arm, center_y - dep / 2, arm, dep),
+                (cx1, center_y - dep / 2, arm, dep),
+                (center_x - dep / 2, cy0 - arm, dep, arm),
+                (center_x - dep / 2, cy1, dep, arm),
             ]:
                 ax.add_patch(plt.Rectangle((x, y), w, h, facecolor="#ff6b00", edgecolor="#ff6b00", alpha=0.7))
 
@@ -1190,26 +1211,217 @@ def plot_plan(result: DesignResult, inp: BuildingInput, zone_name: str = "Lower 
     return fig
 
 
+# ----------------------------- STREAMLIT UI -----------------------------
+
+def streamlit_input_panel() -> BuildingInput:
+    st.sidebar.header("Input Data")
+
+    plan_shape = st.sidebar.radio("Plan shape", ["square", "triangle"], horizontal=True)
+
+    st.sidebar.subheader("Geometry")
+    n_story = int(st.sidebar.number_input("Above-grade stories", min_value=1, max_value=120, value=60, step=1))
+    n_basement = int(st.sidebar.number_input("Basement stories", min_value=0, max_value=20, value=10, step=1))
+    story_height = float(st.sidebar.number_input("Story height (m)", min_value=2.5, max_value=6.0, value=3.2))
+    basement_height = float(st.sidebar.number_input("Basement height (m)", min_value=2.5, max_value=6.0, value=3.0))
+    plan_x = float(st.sidebar.number_input("Plan X (m)", min_value=10.0, max_value=300.0, value=80.0))
+    plan_y = float(st.sidebar.number_input("Plan Y (m)", min_value=10.0, max_value=300.0, value=80.0))
+    n_bays_x = int(st.sidebar.number_input("Bays in X", min_value=1, max_value=30, value=8, step=1))
+    n_bays_y = int(st.sidebar.number_input("Bays in Y", min_value=1, max_value=30, value=8, step=1))
+    bay_x = float(st.sidebar.number_input("Bay X (m)", min_value=2.0, max_value=20.0, value=10.0))
+    bay_y = float(st.sidebar.number_input("Bay Y (m)", min_value=2.0, max_value=20.0, value=10.0))
+
+    st.sidebar.subheader("Vertical circulation / core opening")
+    stair_count = int(st.sidebar.number_input("Stairs", min_value=0, max_value=20, value=2, step=1))
+    elevator_count = int(st.sidebar.number_input("Elevators", min_value=0, max_value=30, value=4, step=1))
+    elevator_area_each = float(st.sidebar.number_input("Elevator area each (m²)", min_value=0.0, max_value=20.0, value=3.5))
+    stair_area_each = float(st.sidebar.number_input("Stair area each (m²)", min_value=0.0, max_value=50.0, value=20.0))
+    service_area = float(st.sidebar.number_input("Service area (m²)", min_value=0.0, max_value=200.0, value=35.0))
+
+    st.sidebar.subheader("Materials / loads")
+    fck = float(st.sidebar.number_input("fck (MPa)", min_value=20.0, max_value=100.0, value=70.0))
+    Ec = float(st.sidebar.number_input("Ec (MPa)", min_value=15000.0, max_value=50000.0, value=36000.0))
+    fy = float(st.sidebar.number_input("fy (MPa)", min_value=200.0, max_value=700.0, value=420.0))
+    DL = float(st.sidebar.number_input("DL (kN/m²)", min_value=0.0, max_value=20.0, value=3.0))
+    LL = float(st.sidebar.number_input("LL (kN/m²)", min_value=0.0, max_value=20.0, value=2.5))
+    slab_finish_allowance = float(st.sidebar.number_input("Slab/fit-out allowance (kN/m²)", min_value=0.0, max_value=10.0, value=1.5))
+    wall_cracked_factor = float(st.sidebar.number_input("Wall cracked factor", min_value=0.10, max_value=1.00, value=0.40))
+    column_cracked_factor = float(st.sidebar.number_input("Column cracked factor", min_value=0.10, max_value=1.00, value=0.70))
+
+    st.sidebar.subheader("Outriggers")
+    outrigger_count = int(st.sidebar.selectbox("Number of outriggers", [0, 1, 2, 3], index=2))
+
+    suggested_levels = []
+    if outrigger_count >= 1:
+        suggested_levels.append(max(1, int(round(n_story * 0.50))))
+    if outrigger_count >= 2:
+        suggested_levels.append(max(1, int(round(n_story * 0.75))))
+    if outrigger_count >= 3:
+        suggested_levels.append(max(1, int(round(n_story * 0.90))))
+
+    levels = []
+    for i in range(outrigger_count):
+        levels.append(int(st.sidebar.number_input(
+            f"Outrigger level {i+1}",
+            min_value=1,
+            max_value=max(1, n_story),
+            value=min(suggested_levels[i], n_story),
+            step=1,
+        )))
+
+    outrigger_truss_depth_m = float(st.sidebar.number_input("Outrigger truss depth (m)", min_value=0.5, max_value=10.0, value=3.0))
+    outrigger_chord_area_m2 = float(st.sidebar.number_input("Chord area (m²)", min_value=0.001, max_value=1.0, value=0.08, format="%.3f"))
+    outrigger_diagonal_area_m2 = float(st.sidebar.number_input("Diagonal area (m²)", min_value=0.001, max_value=1.0, value=0.04, format="%.3f"))
+
+    return BuildingInput(
+        plan_shape=plan_shape,
+        n_story=n_story,
+        n_basement=n_basement,
+        story_height=story_height,
+        basement_height=basement_height,
+        plan_x=plan_x,
+        plan_y=plan_y,
+        n_bays_x=n_bays_x,
+        n_bays_y=n_bays_y,
+        bay_x=bay_x,
+        bay_y=bay_y,
+        stair_count=stair_count,
+        elevator_count=elevator_count,
+        elevator_area_each=elevator_area_each,
+        stair_area_each=stair_area_each,
+        service_area=service_area,
+        fck=fck,
+        Ec=Ec,
+        fy=fy,
+        DL=DL,
+        LL=LL,
+        slab_finish_allowance=slab_finish_allowance,
+        wall_cracked_factor=wall_cracked_factor,
+        column_cracked_factor=column_cracked_factor,
+        outrigger_count=outrigger_count,
+        outrigger_story_levels=levels,
+        outrigger_truss_depth_m=outrigger_truss_depth_m,
+        outrigger_chord_area_m2=outrigger_chord_area_m2,
+        outrigger_diagonal_area_m2=outrigger_diagonal_area_m2,
+    )
+
+
+def main():
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+
+    st.title(APP_TITLE)
+    st.caption(APP_VERSION)
+    st.info(
+        "This rewritten version avoids writing files into the app source directory. "
+        "Reports are shown in the UI and can be downloaded directly with download buttons."
+    )
+
+    if "result" not in st.session_state:
+        st.session_state.result = None
+    if "report" not in st.session_state:
+        st.session_state.report = ""
+
+    inp = streamlit_input_panel()
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        analyze = st.button("Analyze")
+    with col2:
+        show_modes = st.button("Show 5 Modes")
+    with col3:
+        clear_btn = st.button("Clear Results")
+
+    if clear_btn:
+        st.session_state.result = None
+        st.session_state.report = ""
+        st.rerun()
+
+    if analyze:
+        try:
+            with st.spinner("Running iterative MDOF analysis..."):
+                res = run_design(inp)
+                st.session_state.result = res
+                st.session_state.report = build_report(res)
+            st.success(f"Analysis completed in {len(res.iteration_history)} iterations.")
+        except Exception as exc:
+            st.exception(exc)
+
+    if show_modes and st.session_state.result is None:
+        try:
+            with st.spinner("Running analysis first..."):
+                res = run_design(inp)
+                st.session_state.result = res
+                st.session_state.report = build_report(res)
+        except Exception as exc:
+            st.exception(exc)
+
+    result = st.session_state.result
+    if result is None:
+        st.warning("Enter data and click Analyze.")
+        return
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "Summary", "Iteration", "Modes", "Plan", "Report"
+    ])
+
+    with tab1:
+        st.subheader("Summary")
+        st.dataframe(result_summary_table(result), use_container_width=True)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("T_est (s)", f"{result.estimated_period_s:.3f}")
+        c2.metric("T_target (s)", f"{result.design_target_period_s:.3f}")
+        c3.metric("Drift ratio", f"{result.drift_ratio:.5f}")
+        c4.metric("Weight (kN)", f"{result.total_weight_kN:,.0f}")
+
+        if result.redesign_suggestions:
+            st.subheader("Redesign suggestions")
+            for item in result.redesign_suggestions:
+                st.write(f"- {item}")
+
+    with tab2:
+        st.subheader("Iteration history")
+        df_iter = iteration_table(result)
+        st.dataframe(df_iter, use_container_width=True)
+        fig_iter = plot_iteration_history(result)
+        st.pyplot(fig_iter)
+
+        csv_iter = df_iter.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download iteration CSV",
+            data=csv_iter,
+            file_name="iteration_history.csv",
+            mime="text/csv",
+        )
+
+    with tab3:
+        st.subheader("Mode shapes")
+        fig_modes = plot_mode_shapes(result, modes=5)
+        st.pyplot(fig_modes)
+
+    with tab4:
+        st.subheader("Plan view")
+        zone_options = [z.zone.name for z in result.zone_core_results]
+        zone_name = st.selectbox("Zone", zone_options, index=0)
+        fig_plan = plot_plan(result, inp, zone_name=zone_name)
+        st.pyplot(fig_plan)
+
+    with tab5:
+        st.subheader("Report")
+        st.text_area("Text report", st.session_state.report, height=500)
+        st.download_button(
+            "Download report as TXT",
+            data=st.session_state.report,
+            file_name="tall_building_report.txt",
+            mime="text/plain",
+        )
+
+
 if __name__ == "__main__":
-    inp = BuildingInput()
-    result = run_design(inp)
-
-    print(build_report(result))
-    print("\nSummary table:\n")
-    print(result_summary_table(result).to_string(index=False))
-
-    fig1 = plot_iteration_history(result)
-    fig2 = plot_mode_shapes(result, modes=3)
-    fig3 = plot_plan(result, inp, "Lower Zone")
-
-    fig1.savefig("iteration_history.png", dpi=180, bbox_inches="tight")
-    fig2.savefig("mode_shapes.png", dpi=180, bbox_inches="tight")
-    fig3.savefig("plan_view_lower_zone.png", dpi=180, bbox_inches="tight")
-    print("\nSaved: iteration_history.png, mode_shapes.png, plan_view_lower_zone.png")
+    main()
 ''')
 
-path = "/mnt/data/tall_building_clean_jupyter.py"
+path = "/mnt/data/tall_building_streamlit_rewritten.py"
 with open(path, "w", encoding="utf-8") as f:
-    f.write(code)
+    f.write(streamlit_code)
 
 print(f"Saved {path}")
