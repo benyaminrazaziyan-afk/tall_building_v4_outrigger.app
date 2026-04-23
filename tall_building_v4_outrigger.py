@@ -1,1091 +1,1471 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field
 from math import pi, sqrt
-from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import List, Tuple, Optional
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-
-try:
-    import streamlit as st
-except ModuleNotFoundError:
-    class _StreamlitStub:
-        def __getattr__(self, name):
-            def _noop(*args, **kwargs):
-                return None
-            return _noop
-    st = _StreamlitStub()
-
-try:
-    from scipy.linalg import eigh
-except Exception:
-    eigh = None
+import streamlit as st
 
 
-# ===== Embedded MDOF Framework =====
+G = 9.81
+STEEL_DENSITY = 7850.0
 
-from dataclasses import dataclass, field, replace
-from math import pi, sqrt
-from typing import Iterable, List, Optional, Sequence
-
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-
-try:
-    from scipy.linalg import eigh
-except Exception as exc:  # pragma: no cover
-    raise ImportError("scipy is required for generalized eigenvalue solution") from exc
+APP_TITLE = "Tall Building Preliminary Design + Outrigger Belt Truss"
+APP_VERSION = "v5.1-stiffness-fix"
 
 
-# ---------------------------------------------------------------------
-# DATA MODELS
-# ---------------------------------------------------------------------
+# ----------------------------- DATA MODELS -----------------------------
 
 @dataclass
-class Material:
-    E: float                 # Pa
-    fy: float                # Pa
-    density: float = 7850.0  # kg/m3
-
-
-@dataclass
-class CoreWallSection:
-    thickness: float         # m
-    length_x: float          # m
-    length_y: float          # m
-    n_web_x: int = 2
-    n_web_y: int = 2
-    cracked_factor: float = 0.45
+class ZoneDefinition:
+    name: str
+    story_start: int
+    story_end: int
 
     @property
-    def area(self) -> float:
-        return self.n_web_x * self.length_x * self.thickness + self.n_web_y * self.length_y * self.thickness
-
-    def inertia_y(self) -> float:
-        """
-        Equivalent in-plane bending inertia for X-direction sway
-        using walls parallel to Y plus parallel-axis contribution of X walls.
-        This is a simplified closed-form estimate.
-        """
-        t = self.thickness
-        lx = self.length_x
-        ly = self.length_y
-        # walls normal to X contribute mainly by own strong axis
-        I_from_ywalls = self.n_web_y * (t * ly**3 / 12.0)
-        # walls parallel to X contribute with some lever arm; use half-core spacing
-        arm = max(0.25 * lx, t / 2.0)
-        A_x = lx * t
-        I_from_xwalls = self.n_web_x * (lx * t**3 / 12.0 + A_x * arm**2)
-        return self.cracked_factor * (I_from_ywalls + I_from_xwalls)
-
-    def inertia_x(self) -> float:
-        t = self.thickness
-        lx = self.length_x
-        ly = self.length_y
-        I_from_xwalls = self.n_web_x * (t * lx**3 / 12.0)
-        arm = max(0.25 * ly, t / 2.0)
-        A_y = ly * t
-        I_from_ywalls = self.n_web_y * (ly * t**3 / 12.0 + A_y * arm**2)
-        return self.cracked_factor * (I_from_xwalls + I_from_ywalls)
+    def n_stories(self) -> int:
+        return self.story_end - self.story_start + 1
 
 
 @dataclass
-class ColumnSection:
-    b: float                 # m
-    h: float                 # m
-    cracked_factor: float = 0.70
-
-    @property
-    def area(self) -> float:
-        return self.b * self.h
-
-    def inertia_x(self) -> float:
-        return self.cracked_factor * self.b * self.h**3 / 12.0
-
-    def inertia_y(self) -> float:
-        return self.cracked_factor * self.h * self.b**3 / 12.0
+class OutriggerResult:
+    story_level: int
+    height_m: float
+    truss_depth_m: float
+    truss_width_m: float
+    chord_area_m2: float
+    diagonal_area_m2: float
+    axial_stiffness_kN: float
+    equivalent_spring_kN_m: float
+    stiffness_contribution: float
+    K_rotational_Nm_per_rad: float
+    effective_I_addition_m4: float
 
 
 @dataclass
-class OutriggerLevel:
-    story: int
-    axis: str = "x"                 # "x" or "y"
-    truss_depth: float = 3.0        # m
-    chord_area: float = 0.08        # m2
-    diagonal_area: float = 0.04     # m2
-    truss_E: float = 200e9          # Pa
-
-    def validate(self) -> None:
-        if self.axis.lower() not in {"x", "y"}:
-            raise ValueError(f"axis must be 'x' or 'y', got {self.axis!r}")
-        if self.story < 1:
-            raise ValueError("story must be >= 1")
-
-
-@dataclass
-class TowerInput:
-    n_story: int
-    story_height: float
-    plan_x: float
-    plan_y: float
-    floor_mass: float                # kg per typical story
-    core: CoreWallSection
-    perimeter_column: ColumnSection
-    corner_column: ColumnSection
-    n_perimeter_columns_x_face: int
-    n_perimeter_columns_y_face: int
-    outriggers: List[OutriggerLevel] = field(default_factory=list)
-    concrete_E: float = 32e9
-    drift_limit_ratio: float = 1 / 500.0
-    column_material: Material = field(default_factory=lambda: Material(E=32e9, fy=420e6))
-    wall_material: Material = field(default_factory=lambda: Material(E=32e9, fy=40e6))
-    use_same_floor_mass_all_levels: bool = True
-
-    def height(self) -> float:
-        return self.n_story * self.story_height
-
-    def bay_arm(self, axis: str) -> float:
-        """
-        Lever arm from core face to perimeter column line.
-        """
-        axis = axis.lower()
-        if axis == "x":
-            return max((self.plan_x - self.core.length_x) / 2.0, 0.5)
-        return max((self.plan_y - self.core.length_y) / 2.0, 0.5)
-
-    def n_engaged_columns_per_side(self, axis: str) -> int:
-        axis = axis.lower()
-        return self.n_perimeter_columns_y_face if axis == "x" else self.n_perimeter_columns_x_face
-
-    def validate(self) -> None:
-        if self.n_story < 2:
-            raise ValueError("n_story must be >= 2")
-        if self.story_height <= 0:
-            raise ValueError("story_height must be > 0")
-        if self.floor_mass <= 0:
-            raise ValueError("floor_mass must be > 0")
-        for ou in self.outriggers:
-            ou.validate()
-            if ou.story > self.n_story:
-                raise ValueError(f"outrigger story {ou.story} > n_story {self.n_story}")
+class ZoneCoreResult:
+    zone: ZoneDefinition
+    wall_count: int
+    wall_lengths: List[float]
+    wall_thickness: float
+    core_outer_x: float
+    core_outer_y: float
+    core_opening_x: float
+    core_opening_y: float
+    Ieq_gross_m4: float
+    Ieq_effective_m4: float
+    story_slenderness: float
+    perimeter_wall_segments: List[Tuple[str, float, float]]
+    retaining_wall_active: bool
 
 
 @dataclass
-class OutriggerMechanics:
-    story: int
-    axis: str
-    arm: float
-    k_truss_tip: float            # N/m
-    k_column_tip: float           # N/m
-    k_tip_combined: float         # N/m
-    k_story_equiv: float          # N/m
-    k_rot: float                  # N*m/rad
-    axial_force_per_side: float   # N for unit interstory drift proxy
+class ZoneColumnResult:
+    zone: ZoneDefinition
+    corner_column_x_m: float
+    corner_column_y_m: float
+    perimeter_column_x_m: float
+    perimeter_column_y_m: float
+    interior_column_x_m: float
+    interior_column_y_m: float
+    P_corner_kN: float
+    P_perimeter_kN: float
+    P_interior_kN: float
+    I_col_group_effective_m4: float
 
 
 @dataclass
-class AnalysisResult:
-    periods: np.ndarray
-    frequencies: np.ndarray
-    mode_shapes: np.ndarray
-    mass_matrix: np.ndarray
-    stiffness_matrix: np.ndarray
-    story_stiffness_base: np.ndarray
-    story_stiffness_total: np.ndarray
-    outriggers: List[OutriggerMechanics]
-    top_displacement_under_unit_profile: np.ndarray
-    outrigger_axial_by_level: dict[int, float]
-    max_drift_ratio_unit_profile: float
-    input_model: TowerInput
+class ReinforcementEstimate:
+    wall_concrete_volume_m3: float
+    column_concrete_volume_m3: float
+    beam_concrete_volume_m3: float
+    slab_concrete_volume_m3: float
+    wall_steel_kg: float
+    column_steel_kg: float
+    beam_steel_kg: float
+    slab_steel_kg: float
+    total_steel_kg: float
+    outrigger_steel_kg: float = 0.0
 
 
 @dataclass
-class DesignIterationResult:
+class ModalResult:
+    n_dof: int
+    periods_s: List[float]
+    frequencies_hz: List[float]
+    mode_shapes: List[List[float]]
+    story_masses_kg: List[float]
+    story_stiffness_N_per_m: List[float]
+    effective_mass_ratios: List[float]
+    cumulative_effective_mass_ratios: List[float]
+
+
+@dataclass
+class IterationLog:
     iteration: int
-    period_1: float
-    perimeter_col_b: float
-    perimeter_col_h: float
-    corner_col_b: float
-    corner_col_h: float
-    core_thickness: float
-    max_outrigger_axial: float
-    max_drift_unit_profile: float
+    core_scale: float
+    column_scale: float
+    T_estimated: float
+    T_target: float
+    error_percent: float
+    total_weight_kN: float
+    K_total_N_m: float
+    K_core_N_m: float
+    K_cols_N_m: float
+    K_outrigger_N_m: float
 
 
-# ---------------------------------------------------------------------
-# BASIC STRUCTURAL FUNCTIONS
-# ---------------------------------------------------------------------
-
-def _ensure_vector_mass(inp: TowerInput) -> np.ndarray:
-    return np.full(inp.n_story, inp.floor_mass, dtype=float)
-
-
-def _story_stiffness_from_core(inp: TowerInput, axis: str) -> np.ndarray:
-    """
-    Approximate each story lateral stiffness contribution from the core.
-    k_story ≈ 12 E I / h^3
-    """
-    axis = axis.lower()
-    I = inp.core.inertia_y() if axis == "x" else inp.core.inertia_x()
-    E = inp.wall_material.E
-    k_story = 12.0 * E * I / inp.story_height**3
-    return np.full(inp.n_story, k_story, dtype=float)
-
-
-def _story_stiffness_from_columns(inp: TowerInput, axis: str) -> np.ndarray:
-    """
-    Approximate each story lateral stiffness contribution from all perimeter/corner columns.
-    """
-    axis = axis.lower()
-    E = inp.column_material.E
-
-    if axis == "x":
-        I_per = inp.perimeter_column.inertia_y()
-        I_cor = inp.corner_column.inertia_y()
-    else:
-        I_per = inp.perimeter_column.inertia_x()
-        I_cor = inp.corner_column.inertia_x()
-
-    n_per_cols = 2 * inp.n_engaged_columns_per_side(axis)
-    n_corner = 4
-    k_per = n_per_cols * 12.0 * E * I_per / inp.story_height**3
-    k_cor = n_corner * 12.0 * E * I_cor / inp.story_height**3
-    return np.full(inp.n_story, k_per + k_cor, dtype=float)
+@dataclass
+class DesignResult:
+    H_m: float
+    floor_area_m2: float
+    total_weight_kN: float
+    effective_modal_mass_kg: float
+    reference_period_s: float
+    design_target_period_s: float
+    upper_limit_period_s: float
+    estimated_period_s: float
+    period_error_ratio: float
+    period_ok: bool
+    drift_ok: bool
+    K_estimated_N_per_m: float
+    top_drift_m: float
+    drift_ratio: float
+    zone_core_results: List[ZoneCoreResult]
+    zone_column_results: List[ZoneColumnResult]
+    outrigger_results: List[OutriggerResult]
+    slab_thickness_m: float
+    beam_width_m: float
+    beam_depth_m: float
+    reinforcement: ReinforcementEstimate
+    optimization_success: bool
+    optimization_message: str
+    core_scale: float
+    column_scale: float
+    messages: List[str] = field(default_factory=list)
+    redesign_suggestions: List[str] = field(default_factory=list)
+    governing_issue: str = ""
+    modal_result: Optional[ModalResult] = None
+    iteration_history: List[IterationLog] = field(default_factory=list)
 
 
-def _assemble_shear_building_K(story_k: np.ndarray) -> np.ndarray:
-    """
-    Standard n-story shear-building stiffness matrix from story stiffnesses.
-    """
-    n = len(story_k)
-    K = np.zeros((n, n), dtype=float)
-    for i in range(n):
-        if i == 0:
-            K[i, i] += story_k[i]
-        else:
-            K[i, i] += story_k[i]
-            K[i, i - 1] -= story_k[i]
-            K[i - 1, i] -= story_k[i]
-            K[i - 1, i - 1] += story_k[i]
-    return K
+@dataclass
+class BuildingInput:
+    plan_shape: str = "square"
+    n_story: int = 60
+    n_basement: int = 10
+    story_height: float = 3.2
+    basement_height: float = 3.0
+    plan_x: float = 80.0
+    plan_y: float = 80.0
+    n_bays_x: int = 8
+    n_bays_y: int = 8
+    bay_x: float = 10.0
+    bay_y: float = 10.0
+
+    stair_count: int = 2
+    elevator_count: int = 4
+    elevator_area_each: float = 3.5
+    stair_area_each: float = 20.0
+    service_area: float = 35.0
+    corridor_factor: float = 1.40
+
+    fck: float = 70.0
+    Ec: float = 36000.0
+    fy: float = 420.0
+
+    DL: float = 3.0
+    LL: float = 2.5
+    slab_finish_allowance: float = 1.5
+    facade_line_load: float = 1.0
+
+    prelim_lateral_force_coeff: float = 0.015
+    drift_limit_ratio: float = 1 / 500
+
+    min_wall_thickness: float = 0.30
+    max_wall_thickness: float = 1.20
+    min_column_dim: float = 0.70
+    max_column_dim: float = 1.80
+    min_beam_width: float = 0.40
+    min_beam_depth: float = 0.75
+    min_slab_thickness: float = 0.22
+    max_slab_thickness: float = 0.40
+
+    wall_cracked_factor: float = 0.40
+    column_cracked_factor: float = 0.70
+
+    wall_rebar_ratio: float = 0.003
+    column_rebar_ratio: float = 0.010
+    beam_rebar_ratio: float = 0.015
+    slab_rebar_ratio: float = 0.0035
+
+    seismic_mass_factor: float = 1.0
+    Ct: float = 0.0488
+    x_period: float = 0.75
+    upper_period_factor: float = 1.20
+    target_position_factor: float = 0.85
+
+    perimeter_column_factor: float = 1.10
+    corner_column_factor: float = 1.30
+
+    lower_zone_wall_count: int = 8
+    middle_zone_wall_count: int = 6
+    upper_zone_wall_count: int = 4
+
+    basement_retaining_wall_thickness: float = 0.50
+    perimeter_shear_wall_ratio: float = 0.20
+
+    outrigger_count: int = 2
+    outrigger_story_levels: List[int] = field(default_factory=lambda: [30, 45])
+    outrigger_truss_depth_m: float = 3.0
+    outrigger_chord_area_m2: float = 0.08
+    outrigger_diagonal_area_m2: float = 0.04
 
 
-def _assemble_diagonal_mass(masses: np.ndarray) -> np.ndarray:
-    return np.diag(masses)
+# ----------------------------- ENGINE -----------------------------
+
+def total_height(inp: BuildingInput) -> float:
+    return inp.n_story * inp.story_height
 
 
-def _mode_participation_factor(masses: np.ndarray, phi: np.ndarray) -> float:
-    ones = np.ones_like(phi)
-    num = phi.T @ np.diag(masses) @ ones
-    den = phi.T @ np.diag(masses) @ phi
-    return float(num / den)
+def floor_area(inp: BuildingInput) -> float:
+    if inp.plan_shape == "triangle":
+        return 0.5 * inp.plan_x * inp.plan_y
+    return inp.plan_x * inp.plan_y
 
 
-def _equivalent_static_profile_from_mode(masses: np.ndarray, phi: np.ndarray) -> np.ndarray:
-    gamma = _mode_participation_factor(masses, phi)
-    return gamma * masses * phi
+def code_type_period(H: float, Ct: float, x_period: float) -> float:
+    return Ct * (H ** x_period)
 
 
-# ---------------------------------------------------------------------
-# OUTRIGGER MECHANICS
-# ---------------------------------------------------------------------
-
-def _engaged_column_axial_stiffness(inp: TowerInput, story: int, axis: str) -> float:
-    """
-    Axial stiffness of engaged perimeter columns from foundation to the outrigger level.
-    Uses k = sum(EA/L) for one side. Two sides participate through the outrigger arm.
-    """
-    axis = axis.lower()
-    E = inp.column_material.E
-    L = max(story * inp.story_height, inp.story_height)
-    n_side = inp.n_engaged_columns_per_side(axis)
-
-    # Take face columns as perimeter columns; corners are counted separately at a reduced share.
-    A_per = inp.perimeter_column.area
-    A_cor = inp.corner_column.area
-
-    # One side columns plus two corners at 50% participation each.
-    A_side_total = n_side * A_per + 1.0 * A_cor
-    return E * A_side_total / L
+def preliminary_lateral_force_N(inp: BuildingInput, W_total_kN: float) -> float:
+    return inp.prelim_lateral_force_coeff * W_total_kN * 1000.0
 
 
-def _outrigger_truss_tip_stiffness(arm: float, truss_depth: float, chord_area: float, diagonal_area: float, truss_E: float) -> float:
-    """
-    Vertical tip stiffness of one outrigger arm from:
-      - chord couple bending surrogate
-      - diagonal racking surrogate
-    This is simplified but physically meaningful and dimensionally consistent.
-    """
-    d = max(truss_depth, 0.25)
-    b = max(arm, 0.25)
-    Ld = sqrt(b**2 + d**2)
-
-    # Chord-couple equivalent flexural inertia
-    Ieq = 0.5 * chord_area * d**2
-    k_bend = 3.0 * truss_E * Ieq / b**3
-
-    # Diagonal contribution
-    k_diag = 2.0 * truss_E * diagonal_area * d**2 / max(Ld**3, 1e-12)
-
-    return k_bend + k_diag
+def define_three_zones(n_story: int) -> List[ZoneDefinition]:
+    z1 = max(1, round(0.30 * n_story))
+    z2 = max(z1 + 1, round(0.70 * n_story))
+    return [
+        ZoneDefinition("Lower Zone", 1, z1),
+        ZoneDefinition("Middle Zone", z1 + 1, z2),
+        ZoneDefinition("Upper Zone", z2 + 1, n_story),
+    ]
 
 
-def outrigger_mechanics(inp: TowerInput, ou: OutriggerLevel) -> OutriggerMechanics:
-    axis = ou.axis.lower()
-    arm = inp.bay_arm(axis)
-    k_truss_tip = _outrigger_truss_tip_stiffness(
-        arm=arm,
-        truss_depth=ou.truss_depth,
-        chord_area=ou.chord_area,
-        diagonal_area=ou.diagonal_area,
-        truss_E=ou.truss_E,
+def required_opening_area(inp: BuildingInput) -> float:
+    return (
+        inp.elevator_count * inp.elevator_area_each
+        + inp.stair_count * inp.stair_area_each
+        + inp.service_area
+    ) * inp.corridor_factor
+
+
+def opening_dimensions(inp: BuildingInput) -> tuple[float, float]:
+    area = required_opening_area(inp)
+    aspect = 1.6
+    oy = sqrt(area / aspect)
+    return aspect * oy, oy
+
+
+def initial_core_dimensions(inp: BuildingInput, opening_x: float, opening_y: float) -> tuple[float, float]:
+    outer_x = max(opening_x + 3.0, 0.24 * inp.plan_x)
+    outer_y = max(opening_y + 3.0, 0.22 * inp.plan_y)
+    return min(outer_x, 0.42 * inp.plan_x), min(outer_y, 0.42 * inp.plan_y)
+
+
+def active_wall_count_by_zone(inp: BuildingInput, zone_name: str) -> int:
+    return {
+        "Lower Zone": inp.lower_zone_wall_count,
+        "Middle Zone": inp.middle_zone_wall_count,
+        "Upper Zone": inp.upper_zone_wall_count,
+    }[zone_name]
+
+
+def wall_lengths_for_layout(outer_x: float, outer_y: float, wall_count: int) -> List[float]:
+    if wall_count == 4:
+        return [outer_x, outer_x, outer_y, outer_y]
+    if wall_count == 6:
+        return [outer_x, outer_x, outer_y, outer_y, 0.45 * outer_x, 0.45 * outer_x]
+    return [outer_x, outer_x, outer_y, outer_y, 0.45 * outer_x, 0.45 * outer_x, 0.45 * outer_y, 0.45 * outer_y]
+
+
+def wall_rect_inertia_about_global_y(length: float, thickness: float, x_centroid: float) -> float:
+    I_local = length * thickness**3 / 12.0
+    area = length * thickness
+    return I_local + area * x_centroid**2
+
+
+def wall_rect_inertia_about_global_x(length: float, thickness: float, y_centroid: float) -> float:
+    I_local = length * thickness**3 / 12.0
+    area = length * thickness
+    return I_local + area * y_centroid**2
+
+
+def core_equivalent_inertia(outer_x: float, outer_y: float, lengths: List[float], t: float, wall_count: int) -> float:
+    x_side = outer_x / 2.0
+    y_side = outer_y / 2.0
+    top_len, bot_len, left_len, right_len = lengths[0], lengths[1], lengths[2], lengths[3]
+    I_x = 0.0
+    I_y = 0.0
+
+    I_x += wall_rect_inertia_about_global_x(top_len, t, +y_side)
+    I_x += wall_rect_inertia_about_global_x(bot_len, t, -y_side)
+    I_y += (t * top_len**3 / 12.0) + (t * bot_len**3 / 12.0)
+
+    I_y += wall_rect_inertia_about_global_y(left_len, t, -x_side)
+    I_y += wall_rect_inertia_about_global_y(right_len, t, +x_side)
+    I_x += (t * left_len**3 / 12.0) + (t * right_len**3 / 12.0)
+
+    if wall_count >= 6:
+        inner_x = 0.22 * outer_x
+        l1, l2 = lengths[4], lengths[5]
+        I_y += wall_rect_inertia_about_global_y(l1, t, -inner_x)
+        I_y += wall_rect_inertia_about_global_y(l2, t, +inner_x)
+        I_x += (t * l1**3 / 12.0) + (t * l2**3 / 12.0)
+
+    if wall_count >= 8:
+        inner_y = 0.22 * outer_y
+        l3, l4 = lengths[6], lengths[7]
+        I_x += wall_rect_inertia_about_global_x(l3, t, -inner_y)
+        I_x += wall_rect_inertia_about_global_x(l4, t, +inner_y)
+        I_y += (t * l3**3 / 12.0) + (t * l4**3 / 12.0)
+
+    return min(I_x, I_y)
+
+
+def perimeter_wall_segments_for_square(inp: BuildingInput, zone: ZoneDefinition) -> List[Tuple[str, float, float]]:
+    if zone.name == "Lower Zone":
+        return [
+            ("top", 0.0, inp.plan_x),
+            ("bottom", 0.0, inp.plan_x),
+            ("left", 0.0, inp.plan_y),
+            ("right", 0.0, inp.plan_y),
+        ]
+    ratio = inp.perimeter_shear_wall_ratio
+    lx = inp.plan_x * ratio
+    ly = inp.plan_y * ratio
+    sx = (inp.plan_x - lx) / 2.0
+    sy = (inp.plan_y - ly) / 2.0
+    return [
+        ("top", sx, sx + lx),
+        ("bottom", sx, sx + lx),
+        ("left", sy, sy + ly),
+        ("right", sy, sy + ly),
+    ]
+
+
+def wall_thickness_by_zone(inp: BuildingInput, H: float, zone: ZoneDefinition, core_scale: float) -> float:
+    base_t = max(inp.min_wall_thickness, min(inp.max_wall_thickness, H / 180.0))
+    zone_factor = {"Lower Zone": 1.00, "Middle Zone": 0.80, "Upper Zone": 0.60}[zone.name]
+    t = base_t * zone_factor * core_scale
+    return max(inp.min_wall_thickness, min(inp.max_wall_thickness, t))
+
+
+def slab_thickness_prelim(inp: BuildingInput, column_scale: float) -> float:
+    span = max(inp.bay_x, inp.bay_y)
+    base = span / 28.0
+    t = base * (0.90 + 0.10 * column_scale)
+    return max(inp.min_slab_thickness, min(inp.max_slab_thickness, t))
+
+
+def beam_size_prelim(inp: BuildingInput, column_scale: float) -> tuple[float, float]:
+    span = max(inp.bay_x, inp.bay_y)
+    depth = max(inp.min_beam_depth, min(2.0, (span / 12.0) * (0.90 + 0.15 * column_scale)))
+    width = max(inp.min_beam_width, 0.45 * depth)
+    return width, depth
+
+
+def directional_dims(base_dim: float, plan_x: float, plan_y: float) -> tuple[float, float]:
+    aspect = max(plan_x, plan_y) / max(min(plan_x, plan_y), 1e-9)
+    if aspect <= 1.10:
+        return base_dim, base_dim
+    major = base_dim * 1.15
+    minor = base_dim * 0.90
+    return (major, minor) if plan_x >= plan_y else (minor, major)
+
+
+def calculate_outrigger_stiffness(inp: BuildingInput, story_level: int, truss_depth: float, chord_area: float, diagonal_area: float) -> OutriggerResult:
+    """محاسبه سختی outrigger با فرمول صحیح"""
+    E = inp.Ec * 1e6  # MPa -> Pa
+    story_height = inp.story_height
+    H_total = total_height(inp)
+    height_m = story_level * story_height
+
+    core_x, core_y = initial_core_dimensions(inp, *opening_dimensions(inp))
+    truss_width_x = (inp.plan_x - core_x) / 2
+    truss_width_y = (inp.plan_y - core_y) / 2
+    truss_width = max(truss_width_x, truss_width_y)
+
+    # سختی axial chord
+    n_chords = 4
+    chord_length = sqrt(truss_depth**2 + (truss_width / 2) ** 2)
+    axial_stiffness = n_chords * E * chord_area / chord_length
+
+    # سختی rotational معادل outrigger
+    # K_rot = 2 * E * A_chord * d^2 / L_chord (برای هر طرف)
+    d_arm = truss_width
+    K_rot = 2 * E * chord_area * d_arm**2 / max(chord_length, 1e-9)
+
+    # سختی equivalent lateral spring
+    # K_eq = K_rot / h^2 (تبدیل moment به force)
+    K_brace = K_rot / (story_height ** 2)
+
+    # فاکتور موقعیت (بیشترین تاثیر در نیمه بالایی)
+    height_ratio = height_m / H_total
+    position_factor = height_ratio * (2 - height_ratio)
+    
+    # سهم effective stiffness
+    stiffness_contribution = K_brace * position_factor
+    
+    # effective I addition برای مقایسه با core
+    effective_I_addition = K_rot * (H_total**2) / (3 * E)
+
+    return OutriggerResult(
+        story_level=story_level,
+        height_m=height_m,
+        truss_depth_m=truss_depth,
+        truss_width_m=truss_width,
+        chord_area_m2=chord_area,
+        diagonal_area_m2=diagonal_area,
+        axial_stiffness_kN=axial_stiffness / 1000.0,
+        equivalent_spring_kN_m=stiffness_contribution / 1000.0,
+        stiffness_contribution=stiffness_contribution,
+        K_rotational_Nm_per_rad=K_rot,
+        effective_I_addition_m4=effective_I_addition,
     )
-    k_col_tip = _engaged_column_axial_stiffness(inp, ou.story, axis)
-
-    # series combination: truss tip flexibility + column axial flexibility
-    k_tip = 1.0 / (1.0 / max(k_truss_tip, 1e-12) + 1.0 / max(k_col_tip, 1e-12))
-
-    # convert to rotational restraint at core:
-    # K_theta = 2 * k_tip * arm^2  (two symmetric sides)
-    k_rot = 2.0 * k_tip * arm**2
-
-    # convert rotational restraint into equivalent translational floor stiffness contribution
-    # u_j ≈ theta * z_j  => F/u ≈ K_theta / z_j^2
-    z = ou.story * inp.story_height
-    k_story_equiv = k_rot / max(z**2, 1e-12)
-
-    # For reporting only: representative axial force per side for unit story displacement proxy
-    # theta_proxy = 1 / z, delta_tip = arm / z
-    axial_force_per_side = k_tip * arm / max(z, 1e-12)
-
-    return OutriggerMechanics(
-        story=ou.story,
-        axis=axis,
-        arm=arm,
-        k_truss_tip=k_truss_tip,
-        k_column_tip=k_col_tip,
-        k_tip_combined=k_tip,
-        k_story_equiv=k_story_equiv,
-        k_rot=k_rot,
-        axial_force_per_side=axial_force_per_side,
-    )
 
 
-# ---------------------------------------------------------------------
-# ANALYSIS
-# ---------------------------------------------------------------------
+def calculate_total_outrigger_stiffness(inp: BuildingInput) -> tuple[List[OutriggerResult], float]:
+    if inp.outrigger_count == 0 or not inp.outrigger_story_levels:
+        return [], 0.0
 
-def analyze_tower(inp: TowerInput, axis: str = "x") -> AnalysisResult:
-    inp.validate()
-    axis = axis.lower()
+    outriggers = []
+    total_K = 0.0
 
-    m = _ensure_vector_mass(inp)
-    k_core = _story_stiffness_from_core(inp, axis)
-    k_cols = _story_stiffness_from_columns(inp, axis)
-    k_total = k_core + k_cols
+    for level in inp.outrigger_story_levels[:inp.outrigger_count]:
+        if 1 <= level <= inp.n_story:
+            item = calculate_outrigger_stiffness(
+                inp,
+                level,
+                inp.outrigger_truss_depth_m,
+                inp.outrigger_chord_area_m2,
+                inp.outrigger_diagonal_area_m2,
+            )
+            outriggers.append(item)
+            total_K += item.stiffness_contribution
 
-    ou_mech: List[OutriggerMechanics] = []
-    for ou in inp.outriggers:
-        if ou.axis.lower() == axis:
-            mech = outrigger_mechanics(inp, ou)
-            ou_mech.append(mech)
-            k_total[ou.story - 1] += mech.k_story_equiv
-
-    K = _assemble_shear_building_K(k_total)
-    M = _assemble_diagonal_mass(m)
-
-    w2, phi = eigh(K, M)
-    positive = w2 > 1e-9
-    w2 = w2[positive]
-    phi = phi[:, positive]
-    w = np.sqrt(w2)
-    periods = 2.0 * pi / w
-    freqs = w / (2.0 * pi)
-
-    # normalize each mode to roof displacement = +1
-    phi_n = phi.copy()
-    for i in range(phi_n.shape[1]):
-        scale = phi_n[-1, i] if abs(phi_n[-1, i]) > 1e-12 else np.max(np.abs(phi_n[:, i]))
-        phi_n[:, i] = phi_n[:, i] / scale
-        if phi_n[-1, i] < 0:
-            phi_n[:, i] *= -1.0
-
-    # unit lateral load profile increasing with height
-    heights = np.arange(1, inp.n_story + 1) * inp.story_height
-    f_unit = heights / heights.sum()
-    u = np.linalg.solve(K, f_unit)
-
-    drift = np.diff(np.hstack([[0.0], u])) / inp.story_height
-    max_drift = float(np.max(np.abs(drift)))
-
-    ou_axial = {}
-    for mech in ou_mech:
-        j = mech.story - 1
-        theta_proxy = u[j] / max(mech.story * inp.story_height, 1e-12)
-        delta_tip = theta_proxy * mech.arm
-        ou_axial[j + 1] = mech.k_tip_combined * delta_tip
-
-    return AnalysisResult(
-        periods=periods,
-        frequencies=freqs,
-        mode_shapes=phi_n,
-        mass_matrix=M,
-        stiffness_matrix=K,
-        story_stiffness_base=k_core + k_cols,
-        story_stiffness_total=k_total,
-        outriggers=ou_mech,
-        top_displacement_under_unit_profile=u,
-        outrigger_axial_by_level=ou_axial,
-        max_drift_ratio_unit_profile=max_drift,
-        input_model=inp,
-    )
+    return outriggers, total_K
 
 
-# ---------------------------------------------------------------------
-# SECTION UPDATE / RE-DESIGN
-# ---------------------------------------------------------------------
+def build_zone_results(inp: BuildingInput, core_scale: float, column_scale: float, slab_t: float) -> tuple[List[ZoneCoreResult], List[ZoneColumnResult]]:
+    H = total_height(inp)
+    zones = define_three_zones(inp.n_story)
+    opening_x, opening_y = opening_dimensions(inp)
+    outer_x, outer_y = initial_core_dimensions(inp, opening_x, opening_y)
 
-def _update_perimeter_columns(inp: TowerInput, result: AnalysisResult, min_dim: float = 0.70, max_dim: float = 2.00) -> ColumnSection:
-    """
-    Increase perimeter column section according to max outrigger axial force.
-    """
-    Nmax = max(result.outrigger_axial_by_level.values(), default=0.0)
-    if Nmax <= 0:
-        return inp.perimeter_column
+    zone_cores: List[ZoneCoreResult] = []
+    zone_cols: List[ZoneColumnResult] = []
 
-    fy = inp.column_material.fy
-    demand_area = 1.20 * Nmax / max(0.35 * fy, 1e-12)
-    old_a = inp.perimeter_column.area
-    target_a = max(old_a, demand_area)
+    q = inp.DL + inp.LL + inp.slab_finish_allowance + slab_t * 25.0
+    sigma_allow = 0.35 * inp.fck * 1000.0
 
-    side = min(max_dim, max(min_dim, sqrt(target_a)))
-    return ColumnSection(b=side, h=side, cracked_factor=inp.perimeter_column.cracked_factor)
+    total_columns = (inp.n_bays_x + 1) * (inp.n_bays_y + 1)
+    corner_cols = 4
+    perimeter_cols = max(0, 2 * (inp.n_bays_x - 1) + 2 * (inp.n_bays_y - 1))
+    interior_cols = max(0, total_columns - corner_cols - perimeter_cols)
 
+    plan_center_x = inp.plan_x / 2.0
+    plan_center_y = inp.plan_y / 2.0
+    r2_sum = 0.0
+    for i in range(inp.n_bays_x + 1):
+        for j in range(inp.n_bays_y + 1):
+            x = i * inp.bay_x
+            y = j * inp.bay_y
+            r2_sum += (x - plan_center_x) ** 2 + (y - plan_center_y) ** 2
 
-def _update_corner_columns(inp: TowerInput, perimeter_col: ColumnSection, min_dim: float = 0.80, max_dim: float = 2.20) -> ColumnSection:
-    target_a = max(inp.corner_column.area, 1.25 * perimeter_col.area)
-    side = min(max_dim, max(min_dim, sqrt(target_a)))
-    return ColumnSection(b=side, h=side, cracked_factor=inp.corner_column.cracked_factor)
+    for zone in zones:
+        wall_count = active_wall_count_by_zone(inp, zone.name)
+        lengths = wall_lengths_for_layout(outer_x, outer_y, wall_count)
+        t = wall_thickness_by_zone(inp, H, zone, core_scale)
+        I_gross = core_equivalent_inertia(outer_x, outer_y, lengths, t, wall_count)
 
+        cracked_factor = inp.wall_cracked_factor
+        if inp.n_story > 40:
+            cracked_factor *= 0.85
+        I_eff = cracked_factor * I_gross
 
-def _update_core(inp: TowerInput, result: AnalysisResult, target_period_reduction_ratio: float = 0.96) -> CoreWallSection:
-    """
-    If the outrigger is active and the first-mode period is still too large,
-    thicken the core moderately. This is a design-feedback approximation.
-    """
-    if len(result.periods) == 0:
-        return inp.core
-
-    T1 = float(result.periods[0])
-
-    # reference without outrigger using same sections
-    bare = replace(inp, outriggers=[])
-    bare_result = analyze_tower(bare, axis="x")
-    Tbare = float(bare_result.periods[0])
-
-    if T1 <= target_period_reduction_ratio * Tbare:
-        return inp.core
-
-    ratio = min(max(T1 / max(target_period_reduction_ratio * Tbare, 1e-12), 1.0), 1.15)
-    new_t = min(inp.core.thickness * ratio, 1.50)
-    return replace(inp.core, thickness=new_t)
-
-
-def redesign_with_outriggers(inp: TowerInput, axis: str = "x", max_iter: int = 6, verbose: bool = False) -> tuple[TowerInput, AnalysisResult, pd.DataFrame]:
-    """
-    Iterative loop:
-    1) Analyze with current sections.
-    2) Read outrigger axial demand.
-    3) Update perimeter/corner columns.
-    4) Update core if needed.
-    5) Re-analyze until converged.
-    """
-    model = replace(inp)
-    hist: list[DesignIterationResult] = []
-
-    for it in range(1, max_iter + 1):
-        res = analyze_tower(model, axis=axis)
-
-        new_per = _update_perimeter_columns(model, res)
-        new_cor = _update_corner_columns(model, new_per)
-        tmp_model = replace(model, perimeter_column=new_per, corner_column=new_cor)
-        res_tmp = analyze_tower(tmp_model, axis=axis)
-        new_core = _update_core(tmp_model, res_tmp)
-        new_model = replace(tmp_model, core=new_core)
-
-        max_ax = max(res.outrigger_axial_by_level.values(), default=0.0)
-        hist.append(
-            DesignIterationResult(
-                iteration=it,
-                period_1=float(res.periods[0]),
-                perimeter_col_b=model.perimeter_column.b,
-                perimeter_col_h=model.perimeter_column.h,
-                corner_col_b=model.corner_column.b,
-                corner_col_h=model.corner_column.h,
-                core_thickness=model.core.thickness,
-                max_outrigger_axial=max_ax,
-                max_drift_unit_profile=res.max_drift_ratio_unit_profile,
+        perim = perimeter_wall_segments_for_square(inp, zone)
+        zone_cores.append(
+            ZoneCoreResult(
+                zone=zone,
+                wall_count=wall_count,
+                wall_lengths=lengths,
+                wall_thickness=t,
+                core_outer_x=outer_x,
+                core_outer_y=outer_y,
+                core_opening_x=opening_x,
+                core_opening_y=opening_y,
+                Ieq_gross_m4=I_gross,
+                Ieq_effective_m4=I_eff,
+                story_slenderness=inp.story_height / max(t, 1e-9),
+                perimeter_wall_segments=perim,
+                retaining_wall_active=(zone.name == "Lower Zone"),
             )
         )
 
-        if verbose:
-            print(
-                f"it={it:02d}, T1={res.periods[0]:.4f} s, "
-                f"PerCol={model.perimeter_column.b:.3f}x{model.perimeter_column.h:.3f} m, "
-                f"Core t={model.core.thickness:.3f} m, "
-                f"N_ou,max={max_ax/1e3:.1f} kN"
-            )
+        floors_above = inp.n_story - zone.story_start + 1
+        n_effective = floors_above + 0.70 * inp.n_basement
+        tributary_interior = inp.bay_x * inp.bay_y
+        tributary_perimeter = 0.50 * inp.bay_x * inp.bay_y
+        tributary_corner = 0.25 * inp.bay_x * inp.bay_y
 
-        # convergence
-        diffs = [
-            abs(new_model.perimeter_column.area - model.perimeter_column.area) / max(model.perimeter_column.area, 1e-12),
-            abs(new_model.corner_column.area - model.corner_column.area) / max(model.corner_column.area, 1e-12),
-            abs(new_model.core.thickness - model.core.thickness) / max(model.core.thickness, 1e-12),
-        ]
-        model = new_model
-        if max(diffs) < 0.01:
+        P_interior = tributary_interior * q * n_effective * 1.18
+        interior_dim = min(inp.max_column_dim, max(inp.min_column_dim, sqrt(max(P_interior, 1e-9) / sigma_allow))) * column_scale
+        perimeter_dim = min(inp.max_column_dim, max(inp.min_column_dim, interior_dim * inp.perimeter_column_factor))
+        corner_dim = min(inp.max_column_dim, max(inp.min_column_dim, interior_dim * inp.corner_column_factor))
+
+        interior_x, interior_y = directional_dims(interior_dim, inp.plan_x, inp.plan_y)
+        perimeter_x, perimeter_y = directional_dims(perimeter_dim, inp.plan_x, inp.plan_y)
+        corner_x, corner_y = directional_dims(corner_dim, inp.plan_x, inp.plan_y)
+
+        A_corner = corner_x * corner_y
+        A_perim = perimeter_x * perimeter_y
+        A_inter = interior_x * interior_y
+
+        Iavg_corner = max(corner_x * corner_y**3 / 12.0, corner_y * corner_x**3 / 12.0)
+        Iavg_perim = max(perimeter_x * perimeter_y**3 / 12.0, perimeter_y * perimeter_x**3 / 12.0)
+        Iavg_inter = max(interior_x * interior_y**3 / 12.0, interior_y * interior_x**3 / 12.0)
+
+        I_avg = (corner_cols * Iavg_corner + perimeter_cols * Iavg_perim + interior_cols * Iavg_inter) / max(total_columns, 1)
+        A_avg = (corner_cols * A_corner + perimeter_cols * A_perim + interior_cols * A_inter) / max(total_columns, 1)
+        I_col_group = inp.column_cracked_factor * (I_avg * max(total_columns, 1) + A_avg * r2_sum)
+
+        zone_cols.append(
+            ZoneColumnResult(
+                zone=zone,
+                corner_column_x_m=corner_x,
+                corner_column_y_m=corner_y,
+                perimeter_column_x_m=perimeter_x,
+                perimeter_column_y_m=perimeter_y,
+                interior_column_x_m=interior_x,
+                interior_column_y_m=interior_y,
+                P_corner_kN=tributary_corner * q * n_effective * 1.18,
+                P_perimeter_kN=tributary_perimeter * q * n_effective * 1.18,
+                P_interior_kN=P_interior,
+                I_col_group_effective_m4=I_col_group,
+            )
+        )
+
+    return zone_cores, zone_cols
+
+
+def weighted_core_stiffness(inp: BuildingInput, zone_cores: List[ZoneCoreResult]) -> float:
+    H = total_height(inp)
+    E = inp.Ec * 1e6
+    total_flex_factor = 0.0
+    for zc in zone_cores:
+        hi = zc.zone.n_stories * inp.story_height
+        total_flex_factor += (hi / H) / max(E * zc.Ieq_effective_m4 * (1.0 + 0.20 * len(zc.perimeter_wall_segments)), 1e-9)
+    EI_equiv = 1.0 / max(total_flex_factor, 1e-18)
+    return 3.0 * EI_equiv / (H**3)
+
+
+def weighted_column_stiffness(inp: BuildingInput, zone_cols: List[ZoneColumnResult]) -> float:
+    H = total_height(inp)
+    E = inp.Ec * 1e6
+    total_flex_factor = 0.0
+    for zc in zone_cols:
+        hi = zc.zone.n_stories * inp.story_height
+        total_flex_factor += (hi / H) / max(E * zc.I_col_group_effective_m4, 1e-9)
+    EI_equiv = 1.0 / max(total_flex_factor, 1e-18)
+    return 3.0 * EI_equiv / (H**3)
+
+
+def estimate_reinforcement(inp: BuildingInput, zone_cores: List[ZoneCoreResult], zone_cols: List[ZoneColumnResult], slab_t: float, beam_b: float, beam_h: float, outriggers: Optional[List[OutriggerResult]] = None) -> ReinforcementEstimate:
+    n_total_levels = inp.n_story + inp.n_basement
+    total_floor_area = floor_area(inp) * n_total_levels
+
+    wall_concrete = 0.0
+    for zc in zone_cores:
+        zone_height = zc.zone.n_stories * inp.story_height
+        wall_concrete += sum(zc.wall_lengths) * zc.wall_thickness * zone_height
+        for _, a, b in zc.perimeter_wall_segments:
+            wall_concrete += (b - a) * zc.wall_thickness * zone_height
+
+    corner_cols = 4
+    perimeter_cols = max(0, 2 * (inp.n_bays_x - 1) + 2 * (inp.n_bays_y - 1))
+    total_cols = (inp.n_bays_x + 1) * (inp.n_bays_y + 1)
+    interior_cols = max(0, total_cols - corner_cols - perimeter_cols)
+
+    column_concrete = 0.0
+    for zc in zone_cols:
+        zone_height = zc.zone.n_stories * inp.story_height
+        column_concrete += (
+            corner_cols * zc.corner_column_x_m * zc.corner_column_y_m * zone_height
+            + perimeter_cols * zc.perimeter_column_x_m * zc.perimeter_column_y_m * zone_height
+            + interior_cols * zc.interior_column_x_m * zc.interior_column_y_m * zone_height
+        )
+
+    beam_lines_per_floor = max(1, inp.n_bays_y * (inp.n_bays_x + 1) + inp.n_bays_x * (inp.n_bays_y + 1))
+    avg_span = 0.5 * (inp.bay_x + inp.bay_y)
+    total_beam_length = beam_lines_per_floor * avg_span * n_total_levels
+    beam_concrete = beam_b * beam_h * total_beam_length
+    slab_concrete = total_floor_area * slab_t
+
+    wall_steel = wall_concrete * inp.wall_rebar_ratio * STEEL_DENSITY
+    column_steel = column_concrete * inp.column_rebar_ratio * STEEL_DENSITY
+    beam_steel = beam_concrete * inp.beam_rebar_ratio * STEEL_DENSITY
+    slab_steel = slab_concrete * inp.slab_rebar_ratio * STEEL_DENSITY
+
+    outrigger_steel = 0.0
+    if outriggers:
+        for or_result in outriggers:
+            truss_length = 4 * or_result.truss_width_m
+            chord_steel = truss_length * or_result.chord_area_m2 * STEEL_DENSITY
+            diagonal_steel = truss_length * 0.5 * or_result.diagonal_area_m2 * STEEL_DENSITY
+            outrigger_steel += (chord_steel + diagonal_steel) * 2
+
+    return ReinforcementEstimate(
+        wall_concrete_volume_m3=wall_concrete,
+        column_concrete_volume_m3=column_concrete,
+        beam_concrete_volume_m3=beam_concrete,
+        slab_concrete_volume_m3=slab_concrete,
+        wall_steel_kg=wall_steel,
+        column_steel_kg=column_steel,
+        beam_steel_kg=beam_steel,
+        slab_steel_kg=slab_steel,
+        total_steel_kg=wall_steel + column_steel + beam_steel + slab_steel + outrigger_steel,
+        outrigger_steel_kg=outrigger_steel,
+    )
+
+
+def total_weight_kN_from_quantities(inp: BuildingInput, reinf: ReinforcementEstimate) -> float:
+    concrete_vol = (
+        reinf.wall_concrete_volume_m3
+        + reinf.column_concrete_volume_m3
+        + reinf.beam_concrete_volume_m3
+        + reinf.slab_concrete_volume_m3
+    )
+    concrete_weight = concrete_vol * 25.0
+    steel_weight = reinf.total_steel_kg * G / 1000.0
+    A = floor_area(inp)
+    superimposed = (inp.DL + inp.LL + inp.slab_finish_allowance) * A * (inp.n_story + inp.n_basement)
+    facade = inp.facade_line_load * (2 * (inp.plan_x + inp.plan_y)) * inp.n_story
+    return (concrete_weight + steel_weight + superimposed + facade) * inp.seismic_mass_factor
+
+
+def build_story_masses(inp: BuildingInput, total_weight_kN_value: float) -> List[float]:
+    W_story_kN = total_weight_kN_value / max(inp.n_story, 1)
+    return [(W_story_kN * 1000.0) / G for _ in range(inp.n_story)]
+
+
+def build_story_stiffnesses(inp: BuildingInput, K_total: float) -> List[float]:
+    """توزیع سختی طبقات - storyهای پایین سخت‌تر"""
+    n = inp.n_story
+    raw = []
+    for i in range(n):
+        r = i / max(n - 1, 1)
+        # storyهای پایین سخت‌تر (ضریب بیشتر)
+        raw.append(0.80 + 0.55 * r)
+    inv_sum = sum(1.0 / a for a in raw)
+    c = K_total * inv_sum
+    return [c * a for a in raw]
+
+
+def assemble_m_k_with_outriggers(story_masses: List[float], story_stiffness: List[float], outriggers: List[OutriggerResult], story_height: float) -> tuple[np.ndarray, np.ndarray]:
+    """ماتریس سختی با outrigger - coupling صحیح"""
+    n = len(story_masses)
+    M = np.diag(story_masses)
+    K = np.zeros((n, n), dtype=float)
+
+    # سختی storyهای معمولی
+    for i in range(n):
+        ki = story_stiffness[i]
+        if i == 0:
+            K[i, i] += ki
+        else:
+            K[i, i] += ki
+            K[i, i - 1] -= ki
+            K[i - 1, i] -= ki
+            K[i - 1, i - 1] += ki
+
+    # اضافه کردن سختی outrigger
+    # Outrigger یک spring rotational بین core و column است
+    # K_rot_eff = K_rot / h^2 -> equivalent lateral stiffness
+    for or_result in outriggers:
+        story_idx = or_result.story_level - 1
+        if 0 <= story_idx < n:
+            # سختی equivalent lateral
+            K_or = or_result.stiffness_contribution
+            
+            # اضافه به diagonal
+            K[story_idx, story_idx] += K_or
+            
+            # Coupling با story بالا و پایین (اگر وجود داشته باشن)
+            if story_idx > 0:
+                K[story_idx, story_idx - 1] -= K_or * 0.5
+                K[story_idx - 1, story_idx] -= K_or * 0.5
+                K[story_idx - 1, story_idx - 1] += K_or * 0.5
+            if story_idx < n - 1:
+                K[story_idx, story_idx + 1] -= K_or * 0.5
+                K[story_idx + 1, story_idx] -= K_or * 0.5
+                K[story_idx + 1, story_idx + 1] += K_or * 0.5
+
+    return M, K
+
+
+def solve_mdof_modes(inp: BuildingInput, total_weight_kN_value: float, K_total: float, outriggers: Optional[List[OutriggerResult]] = None, n_modes: int = 5) -> ModalResult:
+    masses = build_story_masses(inp, total_weight_kN_value)
+    k_stories = build_story_stiffnesses(inp, K_total)
+
+    if outriggers:
+        M, K = assemble_m_k_with_outriggers(masses, k_stories, outriggers, inp.story_height)
+    else:
+        M = np.diag(masses)
+        K = np.zeros((len(masses), len(masses)), dtype=float)
+        for i in range(len(masses)):
+            ki = k_stories[i]
+            if i == 0:
+                K[i, i] += ki
+            else:
+                K[i, i] += ki
+                K[i, i - 1] -= ki
+                K[i - 1, i] -= ki
+                K[i - 1, i - 1] += ki
+
+    # حل مساله ویژه
+    A = np.linalg.inv(M) @ K
+    eigvals, eigvecs = np.linalg.eig(A)
+    eigvals = np.real(eigvals)
+    eigvecs = np.real(eigvecs)
+
+    pos = eigvals > 1e-12
+    eigvals = eigvals[pos]
+    eigvecs = eigvecs[:, pos]
+
+    order = np.argsort(eigvals)
+    eigvals = eigvals[order]
+    eigvecs = eigvecs[:, order]
+
+    omegas = np.sqrt(eigvals)
+    periods = [2.0 * pi / w for w in omegas[:n_modes]]
+    freqs = [w / (2.0 * pi) for w in omegas[:n_modes]]
+
+    ones = np.ones((len(masses), 1))
+    total_mass = np.sum(np.diag(M)).item()
+
+    mass_ratios = []
+    cumulative = []
+    mode_shapes = []
+    cum = 0.0
+
+    for i in range(min(n_modes, eigvecs.shape[1])):
+        phi = eigvecs[:, i].reshape(-1, 1)
+        denom = (phi.T @ M @ phi).item()
+        gamma = ((phi.T @ M @ ones) / denom).item()
+        meff = gamma**2 * denom
+        ratio = meff / total_mass
+        cum += ratio
+        
+        # Normalization: max displacement = 1.0 (top story)
+        phi_plot = phi.flatten().copy()
+        max_abs = np.max(np.abs(phi_plot))
+        if max_abs > 1e-12:
+            phi_plot = phi_plot / max_abs
+        # Ensure positive at top
+        if phi_plot[-1] < 0:
+            phi_plot = -phi_plot
+            
+        mode_shapes.append(phi_plot.tolist())
+        mass_ratios.append(ratio)
+        cumulative.append(cum)
+
+    return ModalResult(
+        n_dof=len(masses),
+        periods_s=periods,
+        frequencies_hz=freqs,
+        mode_shapes=mode_shapes,
+        story_masses_kg=masses,
+        story_stiffness_N_per_m=k_stories,
+        effective_mass_ratios=mass_ratios,
+        cumulative_effective_mass_ratios=cumulative,
+    )
+
+
+def generate_redesign_suggestions(inp: BuildingInput, T_est: float, T_target: float, T_limit: float, drift_ratio: float, drift_limit: float, core_scale: float, column_scale: float) -> tuple[str, List[str]]:
+    suggestions: List[str] = []
+    governing_issue = "OK"
+
+    if T_est > T_limit:
+        governing_issue = "Period exceeds upper limit"
+        suggestions.extend([
+            "Increase lateral stiffness by enlarging core walls and perimeter columns.",
+            "Increase active wall count in middle and upper zones.",
+            "Consider larger core footprint if architecture permits.",
+            "Add or strengthen outriggers.",
+        ])
+    elif T_est > 1.10 * T_target:
+        governing_issue = "Period above target"
+        suggestions.extend([
+            "System is softer than target.",
+            "Increase wall thickness or internal core wall engagement.",
+            "Increase corner and perimeter columns.",
+            "Consider adding outriggers.",
+        ])
+    elif T_est < 0.90 * T_target:
+        governing_issue = "Period below target"
+        suggestions.extend([
+            "System is stiffer than target and may be uneconomical.",
+            "Reduce wall thicknesses or column sizes where feasible.",
+        ])
+
+    if drift_ratio > drift_limit:
+        governing_issue = "Drift exceeds allowable limit"
+        suggestions.extend([
+            "Increase global stiffness by enlarging core and perimeter columns.",
+            "Increase wall ratio or add perimeter wall segments.",
+            "Add outriggers to control drift.",
+        ])
+
+    if core_scale >= 1.55:
+        suggestions.append("Core scale factor is near its upper bound.")
+    if column_scale >= 1.55:
+        suggestions.append("Column scale factor is near its upper bound.")
+    if not suggestions:
+        suggestions.append("Structural system appears preliminarily adequate.")
+
+    return governing_issue, suggestions
+
+
+def evaluate_design(inp: BuildingInput, core_scale: float, column_scale: float, beta: float) -> dict:
+    H = total_height(inp)
+    T_ref = code_type_period(H, inp.Ct, inp.x_period)
+    T_upper = inp.upper_period_factor * T_ref
+    T_target = T_ref + beta * (T_upper - T_ref)
+
+    slab_t = slab_thickness_prelim(inp, column_scale)
+    beam_b, beam_h = beam_size_prelim(inp, column_scale)
+    zone_cores, zone_cols = build_zone_results(inp, core_scale, column_scale, slab_t)
+
+    outriggers, K_outrigger = calculate_total_outrigger_stiffness(inp)
+    reinf = estimate_reinforcement(inp, zone_cores, zone_cols, slab_t, beam_b, beam_h, outriggers)
+    W_total = total_weight_kN_from_quantities(inp, reinf)
+    M_eff = W_total * 1000.0 / G
+
+    K_core = weighted_core_stiffness(inp, zone_cores)
+    K_cols = weighted_column_stiffness(inp, zone_cols)
+    K_est = K_core + K_cols + K_outrigger
+
+    modal = solve_mdof_modes(inp, W_total, K_est, outriggers=outriggers, n_modes=5)
+    T_est = modal.periods_s[0] if modal.periods_s else 2.0 * pi * sqrt(M_eff / max(K_est, 1e-9))
+    top_drift = preliminary_lateral_force_N(inp, W_total) / max(K_est, 1e-9)
+    drift_ratio = top_drift / max(H, 1e-9)
+    period_error = abs(T_est - T_target) / max(T_target, 1e-9)
+
+    return {
+        "T_ref": T_ref,
+        "T_upper": T_upper,
+        "T_target": T_target,
+        "T_est": T_est,
+        "period_error": period_error,
+        "W_total": W_total,
+        "M_eff": M_eff,
+        "K_est": K_est,
+        "K_core": K_core,
+        "K_cols": K_cols,
+        "K_outrigger": K_outrigger,
+        "top_drift": top_drift,
+        "drift_ratio": drift_ratio,
+        "modal": modal,
+        "zone_cores": zone_cores,
+        "zone_cols": zone_cols,
+        "outriggers": outriggers,
+        "slab_t": slab_t,
+        "beam_b": beam_b,
+        "beam_h": beam_h,
+        "reinf": reinf,
+    }
+
+
+def run_iterative_design(inp: BuildingInput) -> DesignResult:
+    beta = inp.target_position_factor
+    max_iterations = 30
+    tolerance = 0.02
+
+    core_scale = 1.0
+    column_scale = 1.0
+    iteration_history: List[IterationLog] = []
+
+    best_result = None
+    best_error = float("inf")
+
+    MIN_SCALE = 0.10
+    MAX_SCALE = 2.50
+
+    for iteration in range(1, max_iterations + 1):
+        ev = evaluate_design(inp, core_scale, column_scale, beta)
+
+        T_est = ev["T_est"]
+        T_target = ev["T_target"]
+        T_upper = ev["T_upper"]
+        K_core = ev["K_core"]
+        K_cols = ev["K_cols"]
+        K_outrigger = ev["K_outrigger"]
+        K_total = ev["K_est"]
+
+        error = abs(T_est - T_target) / T_target
+        error_percent = error * 100.0
+
+        iteration_history.append(
+            IterationLog(
+                iteration=iteration,
+                core_scale=core_scale,
+                column_scale=column_scale,
+                T_estimated=T_est,
+                T_target=T_target,
+                error_percent=error_percent,
+                total_weight_kN=ev["W_total"],
+                K_total_N_m=K_total,
+                K_core_N_m=K_core,
+                K_cols_N_m=K_cols,
+                K_outrigger_N_m=K_outrigger,
+            )
+        )
+
+        constraints_ok = (T_est <= T_upper) and (ev["drift_ratio"] <= inp.drift_limit_ratio)
+        if error < best_error and constraints_ok:
+            best_error = error
+            best_result = (core_scale, column_scale, ev)
+
+        if error <= tolerance and constraints_ok:
             break
 
-    final = analyze_tower(model, axis=axis)
-    hist_df = pd.DataFrame([x.__dict__ for x in hist])
-    return model, final, hist_df
+        stiffness_ratio = (T_est / T_target) ** 2
+        structural_K = K_core + K_cols
+        core_share = K_core / structural_K if structural_K > 0 else 0.7
+        damping = 0.65
 
+        scale_factor_core = stiffness_ratio ** (core_share / 3.0)
+        scale_factor_col = stiffness_ratio ** ((1.0 - core_share) / 4.0)
 
-# ---------------------------------------------------------------------
-# STUDIES / COMPARISON
-# ---------------------------------------------------------------------
+        new_core_scale = core_scale + damping * (core_scale * scale_factor_core - core_scale)
+        new_column_scale = column_scale + damping * (column_scale * scale_factor_col - column_scale)
 
-def root_outrigger_study(
-    base_inp: TowerInput,
-    candidate_stories: Sequence[int],
-    counts: Sequence[int] = (0, 1, 2, 3),
-    axis: str = "x",
-    redesign: bool = True,
-) -> pd.DataFrame:
-    """
-    Compare 0..n outriggers using first candidate stories.
-    """
-    rows = []
-    template_ou = OutriggerLevel(story=1, axis=axis)
+        new_core_scale = max(MIN_SCALE, min(MAX_SCALE, new_core_scale))
+        new_column_scale = max(MIN_SCALE, min(MAX_SCALE, new_column_scale))
 
-    for c in counts:
-        levels = []
-        for s in list(candidate_stories)[:c]:
-            levels.append(replace(template_ou, story=int(s), axis=axis))
-        inp = replace(base_inp, outriggers=levels)
+        scale_change = abs(new_core_scale - core_scale) + abs(new_column_scale - column_scale)
+        if scale_change < 0.002 and iteration > 3:
+            if error > tolerance:
+                if core_share > 0.5:
+                    new_core_scale = max(MIN_SCALE, core_scale * 0.95)
+                else:
+                    new_column_scale = max(MIN_SCALE, column_scale * 0.95)
+            else:
+                break
 
-        if redesign:
-            model, res, _ = redesign_with_outriggers(inp, axis=axis, max_iter=6, verbose=False)
-        else:
-            model = inp
-            res = analyze_tower(inp, axis=axis)
+        core_scale, column_scale = new_core_scale, new_column_scale
 
-        rows.append(
-            {
-                "n_outriggers": c,
-                "stories": [ou.story for ou in model.outriggers],
-                "T1_s": float(res.periods[0]),
-                "T2_s": float(res.periods[1]) if len(res.periods) > 1 else np.nan,
-                "perimeter_col_m": f"{model.perimeter_column.b:.3f} x {model.perimeter_column.h:.3f}",
-                "corner_col_m": f"{model.corner_column.b:.3f} x {model.corner_column.h:.3f}",
-                "core_t_m": model.core.thickness,
-                "max_outrigger_axial_kN": max(res.outrigger_axial_by_level.values(), default=0.0) / 1e3,
-                "max_drift_ratio_unit": res.max_drift_ratio_unit_profile,
-            }
-        )
-
-    return pd.DataFrame(rows)
-
-
-# ---------------------------------------------------------------------
-# PLOTTING
-# ---------------------------------------------------------------------
-
-def plot_plan(inp: TowerInput, axis: str = "x", figsize: tuple[float, float] = (7, 7)):
-    fig, ax = plt.subplots(figsize=figsize)
-
-    # building perimeter
-    ax.plot([0, inp.plan_x, inp.plan_x, 0, 0], [0, 0, inp.plan_y, inp.plan_y, 0], lw=2)
-
-    # core centered
-    cx0 = 0.5 * (inp.plan_x - inp.core.length_x)
-    cy0 = 0.5 * (inp.plan_y - inp.core.length_y)
-    ax.add_patch(plt.Rectangle((cx0, cy0), inp.core.length_x, inp.core.length_y, fill=False, lw=2))
-
-    axis = axis.lower()
-    if axis == "x":
-        xL = 0.0
-        xR = inp.plan_x
-        ymid = inp.plan_y / 2.0
-        ax.plot([cx0, xL], [ymid, ymid], lw=3)
-        ax.plot([cx0 + inp.core.length_x, xR], [ymid, ymid], lw=3)
-        ax.text(inp.plan_x / 2.0, ymid + 0.8, "Outrigger axis = X", ha="center")
+    if best_result is None:
+        ev = evaluate_design(inp, core_scale, column_scale, beta)
     else:
-        yB = 0.0
-        yT = inp.plan_y
-        xmid = inp.plan_x / 2.0
-        ax.plot([xmid, xmid], [cy0, yB], lw=3)
-        ax.plot([xmid, xmid], [cy0 + inp.core.length_y, yT], lw=3)
-        ax.text(xmid + 0.8, inp.plan_y / 2.0, "Outrigger axis = Y", rotation=90, va="center")
+        core_scale, column_scale, ev = best_result
 
-    ax.set_aspect("equal")
-    ax.set_title("Plan sketch: core and outrigger arm direction")
-    ax.set_xlabel("X (m)")
-    ax.set_ylabel("Y (m)")
-    ax.grid(True, alpha=0.25)
-    return fig, ax
+    T_ref = ev["T_ref"]
+    T_upper = ev["T_upper"]
+    T_target = ev["T_target"]
+    T_est = ev["T_est"]
+    drift_ratio = ev["drift_ratio"]
 
-
-def plot_elevation(inp: TowerInput, figsize: tuple[float, float] = (6, 9)):
-    fig, ax = plt.subplots(figsize=figsize)
-    H = inp.height()
-    x0, x1 = 0.0, inp.plan_x * 0.12
-
-    # tower outline
-    ax.plot([x0, x0], [0, H], lw=2)
-    ax.plot([x1, x1], [0, H], lw=2)
-    ax.plot([x0, x1], [0, 0], lw=2)
-    ax.plot([x0, x1], [H, H], lw=2)
-
-    # story lines
-    for i in range(inp.n_story + 1):
-        z = i * inp.story_height
-        ax.plot([x0, x1], [z, z], lw=0.4, alpha=0.4)
-
-    # outriggers
-    for ou in inp.outriggers:
-        z = ou.story * inp.story_height
-        ax.plot([x0 - 0.15 * x1, x1 + 0.15 * x1], [z, z], lw=2.5)
-        ax.text(x1 + 0.18 * x1, z, f"O @ {ou.story}", va="center")
-
-    ax.set_title("Elevation sketch: outrigger levels")
-    ax.set_xlabel("schematic width")
-    ax.set_ylabel("Height (m)")
-    ax.grid(True, alpha=0.25)
-    return fig, ax
-
-
-def plot_modes(result: AnalysisResult, n_modes: int = 3, scale: float = 1.0):
-    n_modes = min(n_modes, result.mode_shapes.shape[1])
-    z = np.arange(1, result.input_model.n_story + 1) * result.input_model.story_height
-    fig, ax = plt.subplots(figsize=(6, 8))
-    for i in range(n_modes):
-        ax.plot(scale * result.mode_shapes[:, i], z, label=f"Mode {i+1} (T={result.periods[i]:.3f}s)")
-    ax.axvline(0.0, color="k", lw=0.8)
-    ax.set_xlabel("Normalized modal displacement")
-    ax.set_ylabel("Height (m)")
-    ax.set_title("Mode shapes")
-    ax.grid(True, alpha=0.25)
-    ax.legend()
-    return fig, ax
-
-
-def plot_design_history(hist_df: pd.DataFrame):
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(hist_df["iteration"], hist_df["period_1"], marker="o", label="T1")
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Period T1 (s)")
-    ax.set_title("Redesign history")
-    ax.grid(True, alpha=0.25)
-    ax.legend()
-    return fig, ax
-
-
-# ---------------------------------------------------------------------
-# EXAMPLE / DEFAULT MODEL
-# ---------------------------------------------------------------------
-
-def example_input() -> TowerInput:
-    return TowerInput(
-        n_story=60,
-        story_height=3.2,
-        plan_x=80.0,
-        plan_y=80.0,
-        floor_mass=9.0e5,  # 900 t/story
-        core=CoreWallSection(
-            thickness=0.60,
-            length_x=18.0,
-            length_y=18.0,
-            n_web_x=2,
-            n_web_y=2,
-            cracked_factor=0.45,
-        ),
-        perimeter_column=ColumnSection(b=0.95, h=0.95, cracked_factor=0.70),
-        corner_column=ColumnSection(b=1.10, h=1.10, cracked_factor=0.70),
-        n_perimeter_columns_x_face=7,
-        n_perimeter_columns_y_face=7,
-        outriggers=[],
-        concrete_E=32e9,
-        column_material=Material(E=32e9, fy=420e6),
-        wall_material=Material(E=32e9, fy=40e6),
+    period_ok = T_est <= T_upper
+    drift_ok = drift_ratio <= inp.drift_limit_ratio
+    governing_issue, redesign_suggestions = generate_redesign_suggestions(
+        inp, T_est, T_target, T_upper, drift_ratio, inp.drift_limit_ratio, core_scale, column_scale
     )
 
-
-def example_usage():
-    inp = example_input()
-
-    print("=== Bare tower ===")
-    bare = analyze_tower(inp, axis="x")
-    print(f"T1 = {bare.periods[0]:.4f} s")
-
-    print("\n=== Tower with outriggers at 15, 30, 45 ===")
-    ou_levels = [
-        OutriggerLevel(story=15, axis="x"),
-        OutriggerLevel(story=30, axis="x"),
-        OutriggerLevel(story=45, axis="x"),
-    ]
-    inp2 = replace(inp, outriggers=ou_levels)
-    model2, res2, hist = redesign_with_outriggers(inp2, axis="x", max_iter=6, verbose=True)
-    print(f"Final T1 = {res2.periods[0]:.4f} s")
-    print(f"Final perimeter column = {model2.perimeter_column.b:.3f} x {model2.perimeter_column.h:.3f} m")
-    print(f"Final core thickness = {model2.core.thickness:.3f} m")
-
-    print("\n=== Comparison study ===")
-    study = root_outrigger_study(inp, candidate_stories=[15, 30, 45], counts=(0, 1, 2, 3), axis="x", redesign=True)
-    print(study.to_string(index=False))
-
-    return inp, bare, model2, res2, hist, study
-
-
-
-# ===== Streamlit App =====
-
-
-from dataclasses import asdict
-from pathlib import Path
-from typing import List
-import pandas as pd
-import matplotlib.pyplot as plt
-
-try:
-    import streamlit as st
-except ModuleNotFoundError:
-    class _StreamlitStub:
-        def __getattr__(self, name):
-            def _noop(*args, **kwargs):
-                return None
-            return _noop
-    st = _StreamlitStub()
-
-
-AUTHOR_NAME = "Benyamin"
-APP_VERSION = "v5.0-Integrated-MDOF"
-
-st.set_page_config(
-    page_title="Tall Building Integrated MDOF + Outrigger",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-
-def streamlit_input_panel() -> tuple[TowerInput, str]:
-    st.markdown("### Geometry")
-    c1, c2 = st.columns(2)
-    with c1:
-        n_story = st.number_input("Above-grade stories", min_value=2, max_value=120, value=60, step=1)
-        story_height = st.number_input("Story height (m)", min_value=2.5, max_value=6.0, value=3.2)
-        plan_x = st.number_input("Plan X (m)", min_value=20.0, max_value=300.0, value=80.0)
-        n_perim_x_face = st.number_input("Perimeter columns on X face", min_value=2, max_value=30, value=7, step=1)
-        floor_mass = st.number_input("Typical floor mass (kg)", min_value=1e5, max_value=5e6, value=9.0e5, step=1e4, format="%.0f")
-    with c2:
-        plan_y = st.number_input("Plan Y (m)", min_value=20.0, max_value=300.0, value=80.0)
-        n_perim_y_face = st.number_input("Perimeter columns on Y face", min_value=2, max_value=30, value=7, step=1)
-        axis = st.selectbox("Analysis axis", ["x", "y"], index=0)
-        drift_den = st.number_input("Drift denominator", min_value=200.0, max_value=2000.0, value=500.0)
-
-    st.markdown("### Core walls")
-    c3, c4, c5 = st.columns(3)
-    with c3:
-        core_t = st.number_input("Core wall thickness (m)", min_value=0.20, max_value=1.50, value=0.60, step=0.05)
-        core_lx = st.number_input("Core dimension X (m)", min_value=6.0, max_value=40.0, value=18.0, step=0.5)
-    with c4:
-        core_ly = st.number_input("Core dimension Y (m)", min_value=6.0, max_value=40.0, value=18.0, step=0.5)
-        core_nx = st.number_input("Number of X core webs", min_value=1, max_value=6, value=2, step=1)
-    with c5:
-        core_ny = st.number_input("Number of Y core webs", min_value=1, max_value=6, value=2, step=1)
-        core_cr = st.number_input("Core cracked factor", min_value=0.10, max_value=1.00, value=0.45, step=0.05)
-
-    st.markdown("### Columns")
-    c6, c7 = st.columns(2)
-    with c6:
-        perim_b = st.number_input("Perimeter column b (m)", min_value=0.40, max_value=2.50, value=0.95, step=0.05)
-        perim_h = st.number_input("Perimeter column h (m)", min_value=0.40, max_value=2.50, value=0.95, step=0.05)
-        perim_cr = st.number_input("Perimeter cracked factor", min_value=0.10, max_value=1.00, value=0.70, step=0.05)
-    with c7:
-        corner_b = st.number_input("Corner column b (m)", min_value=0.40, max_value=2.50, value=1.10, step=0.05)
-        corner_h = st.number_input("Corner column h (m)", min_value=0.40, max_value=2.50, value=1.10, step=0.05)
-        corner_cr = st.number_input("Corner cracked factor", min_value=0.10, max_value=1.00, value=0.70, step=0.05)
-
-    st.markdown("### Materials")
-    c8, c9 = st.columns(2)
-    with c8:
-        Ec = st.number_input("Concrete E (Pa)", min_value=20e9, max_value=60e9, value=32e9, step=1e9, format="%.0f")
-        fy_col = st.number_input("Column fy (Pa)", min_value=200e6, max_value=700e6, value=420e6, step=10e6, format="%.0f")
-    with c9:
-        fy_wall = st.number_input("Wall strength proxy fy (Pa)", min_value=20e6, max_value=100e6, value=40e6, step=1e6, format="%.0f")
-
-    st.markdown("### Outriggers")
-    c10, c11, c12 = st.columns(3)
-    with c10:
-        n_or = st.number_input("Number of outriggers", min_value=0, max_value=5, value=0, step=1)
-    with c11:
-        truss_depth = st.number_input("Truss depth (m)", min_value=1.0, max_value=8.0, value=3.0, step=0.1)
-        chord_area = st.number_input("Chord area (m²)", min_value=0.01, max_value=0.50, value=0.08, step=0.01, format="%.3f")
-    with c12:
-        diag_area = st.number_input("Diagonal area (m²)", min_value=0.01, max_value=0.50, value=0.04, step=0.01, format="%.3f")
-        Es_truss = st.number_input("Truss steel E (Pa)", min_value=100e9, max_value=250e9, value=200e9, step=10e9, format="%.0f")
-
-    ou_story_levels: List[int] = []
-    if int(n_or) > 0:
-        st.markdown("**Outrigger story levels**")
-        cols = st.columns(min(3, int(n_or)))
-        defaults = [15, 30, 45, 50, 55]
-        for i in range(int(n_or)):
-            with cols[i % len(cols)]:
-                lev = st.number_input(
-                    f"Outrigger {i+1} story",
-                    min_value=1,
-                    max_value=int(n_story),
-                    value=min(defaults[i], int(n_story)),
-                    step=1,
-                    key=f"or_story_{i}"
-                )
-                ou_story_levels.append(int(lev))
-
-    core = CoreWallSection(
-        thickness=float(core_t),
-        length_x=float(core_lx),
-        length_y=float(core_ly),
-        n_web_x=int(core_nx),
-        n_web_y=int(core_ny),
-        cracked_factor=float(core_cr),
-    )
-    perim = ColumnSection(b=float(perim_b), h=float(perim_h), cracked_factor=float(perim_cr))
-    corner = ColumnSection(b=float(corner_b), h=float(corner_h), cracked_factor=float(corner_cr))
-
-    outriggers = [
-        OutriggerLevel(
-            story=s,
-            axis=str(axis),
-            truss_depth=float(truss_depth),
-            chord_area=float(chord_area),
-            diagonal_area=float(diag_area),
-            truss_E=float(Es_truss),
-        )
-        for s in ou_story_levels
+    messages = [
+        "Target formula: T_target = T_ref + beta*(T_upper - T_ref)",
+        f"beta = {beta:.3f}",
+        f"T_ref = {T_ref:.3f} s",
+        f"T_upper = {T_upper:.3f} s",
+        f"T_target = {T_target:.3f} s",
+        f"Final T_est (MDOF) = {T_est:.3f} s",
+        f"Iterations used = {len(iteration_history)}",
+        f"Mode 1 effective mass = {100 * ev['modal'].effective_mass_ratios[0]:.1f}%",
     ]
 
-    inp = TowerInput(
-        n_story=int(n_story),
-        story_height=float(story_height),
-        plan_x=float(plan_x),
-        plan_y=float(plan_y),
-        floor_mass=float(floor_mass),
-        core=core,
-        perimeter_column=perim,
-        corner_column=corner,
-        n_perimeter_columns_x_face=int(n_perim_x_face),
-        n_perimeter_columns_y_face=int(n_perim_y_face),
-        outriggers=outriggers,
-        concrete_E=float(Ec),
-        drift_limit_ratio=1.0 / float(drift_den),
-        column_material=Material(E=float(Ec), fy=float(fy_col)),
-        wall_material=Material(E=float(Ec), fy=float(fy_wall)),
+    if ev["outriggers"]:
+        messages.append(f"Outrigger count = {len(ev['outriggers'])}")
+        messages.append(f"Outrigger stiffness contribution = {ev['K_outrigger']:.2e} N/m")
+
+    return DesignResult(
+        H_m=total_height(inp),
+        floor_area_m2=floor_area(inp),
+        total_weight_kN=ev["W_total"],
+        effective_modal_mass_kg=ev["M_eff"],
+        reference_period_s=T_ref,
+        design_target_period_s=T_target,
+        upper_limit_period_s=T_upper,
+        estimated_period_s=T_est,
+        period_error_ratio=ev["period_error"],
+        period_ok=period_ok,
+        drift_ok=drift_ok,
+        K_estimated_N_per_m=ev["K_est"],
+        top_drift_m=ev["top_drift"],
+        drift_ratio=drift_ratio,
+        zone_core_results=ev["zone_cores"],
+        zone_column_results=ev["zone_cols"],
+        outrigger_results=ev["outriggers"],
+        slab_thickness_m=ev["slab_t"],
+        beam_width_m=ev["beam_b"],
+        beam_depth_m=ev["beam_h"],
+        reinforcement=ev["reinf"],
+        optimization_success=True,
+        optimization_message="Iterative MDOF convergence",
+        core_scale=core_scale,
+        column_scale=column_scale,
+        messages=messages,
+        redesign_suggestions=redesign_suggestions,
+        governing_issue=governing_issue,
+        modal_result=ev["modal"],
+        iteration_history=iteration_history,
     )
-    return inp, str(axis)
 
 
-def build_report(inp: TowerInput, axis: str, designed_model: TowerInput, final_result, hist_df: pd.DataFrame) -> str:
+def run_design(inp: BuildingInput) -> DesignResult:
+    return run_iterative_design(inp)
+
+
+# ----------------------------- REPORTS / TABLES -----------------------------
+
+def build_report(result: DesignResult) -> str:
     lines = []
-    lines.append("=" * 78)
-    lines.append("TALL BUILDING INTEGRATED MDOF + OUTRIGGER REPORT")
-    lines.append("=" * 78)
+    lines.append("=" * 74)
+    lines.append(f"{APP_TITLE} - {APP_VERSION}")
+    lines.append("=" * 74)
     lines.append("")
-    lines.append("INPUT MODEL")
-    lines.append("-" * 78)
-    lines.append(f"Stories                         = {inp.n_story}")
-    lines.append(f"Story height                    = {inp.story_height:.3f} m")
-    lines.append(f"Total height                    = {inp.height():.3f} m")
-    lines.append(f"Plan                            = {inp.plan_x:.3f} x {inp.plan_y:.3f} m")
-    lines.append(f"Analysis axis                   = {axis.upper()}")
-    lines.append(f"Typical floor mass              = {inp.floor_mass:,.0f} kg")
+    lines.append("GLOBAL RESPONSE")
+    lines.append("-" * 74)
+    lines.append(f"Reference period               = {result.reference_period_s:.3f} s")
+    lines.append(f"Design target period           = {result.design_target_period_s:.3f} s")
+    lines.append(f"Estimated dynamic period       = {result.estimated_period_s:.3f} s")
+    lines.append(f"Upper limit period             = {result.upper_limit_period_s:.3f} s")
+    lines.append(f"Period error ratio             = {100 * result.period_error_ratio:.2f} %")
+    lines.append(f"Period check                   = {'OK' if result.period_ok else 'NOT OK'}")
+    lines.append(f"Total stiffness                = {result.K_estimated_N_per_m:,.3e} N/m")
+    if result.outrigger_results:
+        lines.append(f"Outrigger stiffness            = {sum(o.stiffness_contribution for o in result.outrigger_results):,.3e} N/m")
+    lines.append(f"Estimated top drift            = {result.top_drift_m:.3f} m")
+    lines.append(f"Estimated drift ratio          = {result.drift_ratio:.5f}")
+    lines.append(f"Drift check                    = {'OK' if result.drift_ok else 'NOT OK'}")
+    lines.append(f"Total structural weight        = {result.total_weight_kN:,.0f} kN")
+    lines.append(f"Core scale factor              = {result.core_scale:.3f}")
+    lines.append(f"Column scale factor            = {result.column_scale:.3f}")
     lines.append("")
-    lines.append("FINAL DESIGNED SECTIONS")
-    lines.append("-" * 78)
-    lines.append(f"Core thickness                  = {designed_model.core.thickness:.3f} m")
-    lines.append(f"Core dimensions                 = {designed_model.core.length_x:.3f} x {designed_model.core.length_y:.3f} m")
-    lines.append(f"Perimeter column                = {designed_model.perimeter_column.b:.3f} x {designed_model.perimeter_column.h:.3f} m")
-    lines.append(f"Corner column                   = {designed_model.corner_column.b:.3f} x {designed_model.corner_column.h:.3f} m")
+    lines.append("OUTRIGGERS")
+    lines.append("-" * 74)
+    if result.outrigger_results:
+        for o in result.outrigger_results:
+            lines.append(
+                f"Story {o.story_level:>3} | h = {o.height_m:>6.1f} m | "
+                f"K = {o.stiffness_contribution:>10.3e} N/m | "
+                f"Krot = {o.K_rotational_Nm_per_rad:>10.3e} Nm/rad"
+            )
+    else:
+        lines.append("No outriggers defined.")
     lines.append("")
-    lines.append("DYNAMIC RESPONSE")
-    lines.append("-" * 78)
-    for i, T in enumerate(final_result.periods[:5], start=1):
-        lines.append(f"Mode {i} period                 = {T:.4f} s")
-    lines.append(f"Max drift ratio (unit profile)  = {final_result.max_drift_ratio_unit_profile:.6f}")
+    lines.append("ZONE-BY-ZONE CORE")
+    lines.append("-" * 74)
+    for z in result.zone_core_results:
+        lines.append(
+            f"{z.zone.name:12s} ({z.zone.story_start:>2}-{z.zone.story_end:<2}) | "
+            f"t = {z.wall_thickness:.2f} m | Ieff = {z.Ieq_effective_m4:,.2f} m^4 | walls = {z.wall_count}"
+        )
     lines.append("")
-    if final_result.outriggers:
-        lines.append("OUTRIGGER MECHANICS")
-        lines.append("-" * 78)
-        for mech in final_result.outriggers:
-            lines.append(f"Story {mech.story:>3} | axis={mech.axis.upper()} | arm={mech.arm:.3f} m | "
-                         f"k_truss={mech.k_truss_tip:,.3e} N/m | k_col={mech.k_column_tip:,.3e} N/m | "
-                         f"k_story={mech.k_story_equiv:,.3e} N/m")
-        lines.append("")
-    if not hist_df.empty:
-        lines.append("ITERATION HISTORY")
-        lines.append("-" * 78)
-        lines.append(hist_df.to_string(index=False))
-        lines.append("")
+    lines.append("ZONE-BY-ZONE COLUMNS")
+    lines.append("-" * 74)
+    for z in result.zone_column_results:
+        lines.append(
+            f"{z.zone.name:12s} ({z.zone.story_start:>2}-{z.zone.story_end:<2}) | "
+            f"Corner = {z.corner_column_x_m:.2f}x{z.corner_column_y_m:.2f} m | "
+            f"Perim = {z.perimeter_column_x_m:.2f}x{z.perimeter_column_y_m:.2f} m | "
+            f"Interior = {z.interior_column_x_m:.2f}x{z.interior_column_y_m:.2f} m"
+        )
+    lines.append("")
+    lines.append("MESSAGES")
+    lines.append("-" * 74)
+    for m in result.messages:
+        lines.append(f"- {m}")
     return "\n".join(lines)
 
 
+def result_summary_table(result: DesignResult) -> pd.DataFrame:
+    return pd.DataFrame({
+        "Parameter": [
+            "H (m)", "Floor Area (m²)", "Weight (kN)", "T_ref (s)", "T_target (s)", "T_est (s)",
+            "T_upper (s)", "Drift (m)", "Drift Ratio", "Beam b (m)", "Beam h (m)", "Slab t (m)"
+        ],
+        "Value": [
+            result.H_m, result.floor_area_m2, result.total_weight_kN, result.reference_period_s,
+            result.design_target_period_s, result.estimated_period_s, result.upper_limit_period_s,
+            result.top_drift_m, result.drift_ratio, result.beam_width_m, result.beam_depth_m, result.slab_thickness_m
+        ]
+    })
 
-def _candidate_stories(inp: TowerInput) -> list[int]:
-    defaults = sorted(set([
-        max(2, round(0.25 * inp.n_story)),
-        max(3, round(0.50 * inp.n_story)),
-        max(4, round(0.75 * inp.n_story)),
-    ]))
-    return defaults
+
+def iteration_table(result: DesignResult) -> pd.DataFrame:
+    return pd.DataFrame([{
+        "iteration": it.iteration,
+        "core_scale": it.core_scale,
+        "column_scale": it.column_scale,
+        "T_estimated_s": it.T_estimated,
+        "T_target_s": it.T_target,
+        "error_percent": it.error_percent,
+        "total_weight_kN": it.total_weight_kN,
+        "K_total_N_m": it.K_total_N_m,
+        "K_core_N_m": it.K_core_N_m,
+        "K_cols_N_m": it.K_cols_N_m,
+        "K_outrigger_N_m": it.K_outrigger_N_m,
+    } for it in result.iteration_history])
 
 
-def replace_for_study(inp: TowerInput) -> TowerInput:
-    # same geometry/materials, no outriggers; study will add them
-    return TowerInput(
-        n_story=inp.n_story,
-        story_height=inp.story_height,
-        plan_x=inp.plan_x,
-        plan_y=inp.plan_y,
-        floor_mass=inp.floor_mass,
-        core=inp.core,
-        perimeter_column=inp.perimeter_column,
-        corner_column=inp.corner_column,
-        n_perimeter_columns_x_face=inp.n_perimeter_columns_x_face,
-        n_perimeter_columns_y_face=inp.n_perimeter_columns_y_face,
-        outriggers=[],
-        concrete_E=inp.concrete_E,
-        drift_limit_ratio=inp.drift_limit_ratio,
-        column_material=inp.column_material,
-        wall_material=inp.wall_material,
+# ----------------------------- PLOTS -----------------------------
+
+def plot_mode_shapes(result: DesignResult, modes: int = 3) -> plt.Figure:
+    modal = result.modal_result
+    if modal is None:
+        raise ValueError("Modal result is not available.")
+
+    fig, ax = plt.subplots(figsize=(7, 8))
+    y = np.arange(1, modal.n_dof + 1)
+
+    for i in range(min(modes, len(modal.mode_shapes))):
+        ax.plot(modal.mode_shapes[i], y, marker="o", label=f"Mode {i+1} | T={modal.periods_s[i]:.3f}s")
+
+    ax.set_xlabel("Normalized mode shape")
+    ax.set_ylabel("Story")
+    ax.set_title("Mode shapes")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    return fig
+
+
+def plot_iteration_history(result: DesignResult) -> plt.Figure:
+    df = iteration_table(result)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(df["iteration"], df["T_estimated_s"], marker="o", label="T_est")
+    ax.plot(df["iteration"], df["T_target_s"], marker="s", label="T_target")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Period (s)")
+    ax.set_title("Iteration history")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    return fig
+
+
+def plot_plan(result: DesignResult, inp: BuildingInput, zone_name: str = "Lower Zone") -> plt.Figure:
+    core = next(z for z in result.zone_core_results if z.zone.name == zone_name)
+    cols = next(z for z in result.zone_column_results if z.zone.name == zone_name)
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # Boundary
+    ax.plot([0, inp.plan_x, inp.plan_x, 0, 0], [0, 0, inp.plan_y, inp.plan_y, 0], color="black", linewidth=1.5)
+
+    # Grid lines
+    for i in range(inp.n_bays_x + 1):
+        gx = i * inp.bay_x
+        ax.plot([gx, gx], [0, inp.plan_y], color="#cccccc", linewidth=0.8)
+    for j in range(inp.n_bays_y + 1):
+        gy = j * inp.bay_y
+        ax.plot([0, inp.plan_x], [gy, gy], color="#cccccc", linewidth=0.8)
+
+    # Columns
+    for i in range(inp.n_bays_x + 1):
+        for j in range(inp.n_bays_y + 1):
+            px = i * inp.bay_x
+            py = j * inp.bay_y
+            at_lr = i == 0 or i == inp.n_bays_x
+            at_bt = j == 0 or j == inp.n_bays_y
+            if at_lr and at_bt:
+                dx, dy, c = cols.corner_column_x_m, cols.corner_column_y_m, "#8b0000"
+            elif at_lr or at_bt:
+                dx, dy, c = cols.perimeter_column_x_m, cols.perimeter_column_y_m, "#cc5500"
+            else:
+                dx, dy, c = cols.interior_column_x_m, cols.interior_column_y_m, "#4444aa"
+            rect = plt.Rectangle((px - dx / 2, py - dy / 2), dx, dy, facecolor=c, edgecolor=c, alpha=0.9)
+            ax.add_patch(rect)
+
+    # Core outer
+    cx0 = (inp.plan_x - core.core_outer_x) / 2
+    cy0 = (inp.plan_y - core.core_outer_y) / 2
+    cx1 = cx0 + core.core_outer_x
+    cy1 = cy0 + core.core_outer_y
+    
+    # Core opening
+    ix0 = (inp.plan_x - core.core_opening_x) / 2
+    iy0 = (inp.plan_y - core.core_opening_y) / 2
+    ix1 = ix0 + core.core_opening_x
+    iy1 = iy0 + core.core_opening_y
+
+    # Core walls (thick lines)
+    t = core.wall_thickness
+    wall_color = "#2e8b57"
+    
+    # Outer core boundary
+    ax.add_patch(plt.Rectangle((cx0, cy0), core.core_outer_x, core.core_outer_y, 
+                                fill=False, edgecolor=wall_color, linewidth=2.5))
+    ax.add_patch(plt.Rectangle((ix0, iy0), core.core_opening_x, core.core_opening_y, 
+                                fill=False, edgecolor="#666666", linewidth=1.5, linestyle="--"))
+
+    # Wall thickness visualization
+    for x, y, w, h in [
+        (cx0, cy0, core.core_outer_x, t),           # bottom
+        (cx0, cy1 - t, core.core_outer_x, t),       # top
+        (cx0, cy0, t, core.core_outer_y),           # left
+        (cx1 - t, cy0, t, core.core_outer_y),       # right
+    ]:
+        ax.add_patch(plt.Rectangle((x, y), w, h, facecolor=wall_color, edgecolor=wall_color, alpha=0.3))
+
+    # Outriggers - فقط اگر در این zone باشن
+    for or_result in result.outrigger_results:
+        if core.zone.story_start <= or_result.story_level <= core.zone.story_end:
+            arm = or_result.truss_width_m
+            dep = or_result.truss_depth_m
+            center_x = inp.plan_x / 2
+            center_y = inp.plan_y / 2
+            
+            # Outrigger arms (4 directions)
+            outrigger_color = "#ff6b00"
+            # Left arm
+            ax.add_patch(plt.Rectangle((cx0 - arm, center_y - dep/2), arm, dep, 
+                                        facecolor=outrigger_color, edgecolor=outrigger_color, alpha=0.7))
+            # Right arm  
+            ax.add_patch(plt.Rectangle((cx1, center_y - dep/2), arm, dep, 
+                                        facecolor=outrigger_color, edgecolor=outrigger_color, alpha=0.7))
+            # Bottom arm
+            ax.add_patch(plt.Rectangle((center_x - dep/2, cy0 - arm), dep, arm, 
+                                        facecolor=outrigger_color, edgecolor=outrigger_color, alpha=0.7))
+            # Top arm
+            ax.add_patch(plt.Rectangle((center_x - dep/2, cy1), dep, arm, 
+                                        facecolor=outrigger_color, edgecolor=outrigger_color, alpha=0.7))
+
+    ax.set_aspect("equal")
+    ax.set_xlim(-5, inp.plan_x + 5)
+    ax.set_ylim(-5, inp.plan_y + 5)
+    ax.set_title(f"Plan view - {zone_name}")
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    return fig
+
+
+# ----------------------------- STREAMLIT UI -----------------------------
+
+def streamlit_input_panel() -> BuildingInput:
+    st.sidebar.header("Input Data")
+
+    plan_shape = st.sidebar.radio("Plan shape", ["square", "triangle"], horizontal=True)
+
+    st.sidebar.subheader("Geometry")
+    n_story = int(st.sidebar.number_input("Above-grade stories", min_value=1, max_value=120, value=60, step=1))
+    n_basement = int(st.sidebar.number_input("Basement stories", min_value=0, max_value=20, value=10, step=1))
+    story_height = float(st.sidebar.number_input("Story height (m)", min_value=2.5, max_value=6.0, value=3.2))
+    basement_height = float(st.sidebar.number_input("Basement height (m)", min_value=2.5, max_value=6.0, value=3.0))
+    plan_x = float(st.sidebar.number_input("Plan X (m)", min_value=10.0, max_value=300.0, value=80.0))
+    plan_y = float(st.sidebar.number_input("Plan Y (m)", min_value=10.0, max_value=300.0, value=80.0))
+    n_bays_x = int(st.sidebar.number_input("Bays in X", min_value=1, max_value=30, value=8, step=1))
+    n_bays_y = int(st.sidebar.number_input("Bays in Y", min_value=1, max_value=30, value=8, step=1))
+    bay_x = float(st.sidebar.number_input("Bay X (m)", min_value=2.0, max_value=20.0, value=10.0))
+    bay_y = float(st.sidebar.number_input("Bay Y (m)", min_value=2.0, max_value=20.0, value=10.0))
+
+    st.sidebar.subheader("Vertical circulation / core opening")
+    stair_count = int(st.sidebar.number_input("Stairs", min_value=0, max_value=20, value=2, step=1))
+    elevator_count = int(st.sidebar.number_input("Elevators", min_value=0, max_value=30, value=4, step=1))
+    elevator_area_each = float(st.sidebar.number_input("Elevator area each (m²)", min_value=0.0, max_value=20.0, value=3.5))
+    stair_area_each = float(st.sidebar.number_input("Stair area each (m²)", min_value=0.0, max_value=50.0, value=20.0))
+    service_area = float(st.sidebar.number_input("Service area (m²)", min_value=0.0, max_value=200.0, value=35.0))
+
+    st.sidebar.subheader("Materials / loads")
+    fck = float(st.sidebar.number_input("fck (MPa)", min_value=20.0, max_value=100.0, value=70.0))
+    Ec = float(st.sidebar.number_input("Ec (MPa)", min_value=15000.0, max_value=50000.0, value=36000.0))
+    fy = float(st.sidebar.number_input("fy (MPa)", min_value=200.0, max_value=700.0, value=420.0))
+    DL = float(st.sidebar.number_input("DL (kN/m²)", min_value=0.0, max_value=20.0, value=3.0))
+    LL = float(st.sidebar.number_input("LL (kN/m²)", min_value=0.0, max_value=20.0, value=2.5))
+    slab_finish_allowance = float(st.sidebar.number_input("Slab/fit-out allowance (kN/m²)", min_value=0.0, max_value=10.0, value=1.5))
+    wall_cracked_factor = float(st.sidebar.number_input("Wall cracked factor", min_value=0.10, max_value=1.00, value=0.40))
+    column_cracked_factor = float(st.sidebar.number_input("Column cracked factor", min_value=0.10, max_value=1.00, value=0.70))
+
+    st.sidebar.subheader("Outriggers")
+    outrigger_count = int(st.sidebar.selectbox("Number of outriggers", [0, 1, 2, 3], index=2))
+
+    suggested_levels = []
+    if outrigger_count >= 1:
+        suggested_levels.append(max(1, int(round(n_story * 0.50))))
+    if outrigger_count >= 2:
+        suggested_levels.append(max(1, int(round(n_story * 0.75))))
+    if outrigger_count >= 3:
+        suggested_levels.append(max(1, int(round(n_story * 0.90))))
+
+    levels = []
+    for i in range(outrigger_count):
+        levels.append(int(st.sidebar.number_input(
+            f"Outrigger level {i+1}",
+            min_value=1,
+            max_value=max(1, n_story),
+            value=min(suggested_levels[i], n_story),
+            step=1,
+        )))
+
+    outrigger_truss_depth_m = float(st.sidebar.number_input("Outrigger truss depth (m)", min_value=0.5, max_value=10.0, value=3.0))
+    outrigger_chord_area_m2 = float(st.sidebar.number_input("Chord area (m²)", min_value=0.001, max_value=1.0, value=0.08, format="%.3f"))
+    outrigger_diagonal_area_m2 = float(st.sidebar.number_input("Diagonal area (m²)", min_value=0.001, max_value=1.0, value=0.04, format="%.3f"))
+
+    return BuildingInput(
+        plan_shape=plan_shape,
+        n_story=n_story,
+        n_basement=n_basement,
+        story_height=story_height,
+        basement_height=basement_height,
+        plan_x=plan_x,
+        plan_y=plan_y,
+        n_bays_x=n_bays_x,
+        n_bays_y=n_bays_y,
+        bay_x=bay_x,
+        bay_y=bay_y,
+        stair_count=stair_count,
+        elevator_count=elevator_count,
+        elevator_area_each=elevator_area_each,
+        stair_area_each=stair_area_each,
+        service_area=service_area,
+        fck=fck,
+        Ec=Ec,
+        fy=fy,
+        DL=DL,
+        LL=LL,
+        slab_finish_allowance=slab_finish_allowance,
+        wall_cracked_factor=wall_cracked_factor,
+        column_cracked_factor=column_cracked_factor,
+        outrigger_count=outrigger_count,
+        outrigger_story_levels=levels,
+        outrigger_truss_depth_m=outrigger_truss_depth_m,
+        outrigger_chord_area_m2=outrigger_chord_area_m2,
+        outrigger_diagonal_area_m2=outrigger_diagonal_area_m2,
     )
 
 
-st.markdown(
-    """
-    <style>
-    .main .block-container {padding-top: 0.7rem; padding-bottom: 0.7rem; max-width: 100%;}
-    .stButton button {width: 100%; font-weight: 700; height: 3rem;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+def main():
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
 
-st.title("Tall Building Integrated MDOF + Outrigger")
-st.caption(f"Prepared by {AUTHOR_NAME} | {APP_VERSION}")
-st.info(
-    "This version keeps the Streamlit UI, but the solver is driven by the new "
-    "MDOF outrigger framework. The outrigger is assembled at its real level and "
-    "feeds back into section re-sizing."
-)
+    st.title(APP_TITLE)
+    st.caption(APP_VERSION)
+    st.info(
+        "Fixed stiffness formulation: correct outrigger K_rot coupling, "
+        "proper story stiffness distribution (lower stories stiffer), "
+        "and improved plan visualization."
+    )
 
-if "designed_model" not in st.session_state:
-    st.session_state.designed_model = None
-if "analysis_result" not in st.session_state:
-    st.session_state.analysis_result = None
-if "history_df" not in st.session_state:
-    st.session_state.history_df = None
-if "study_df" not in st.session_state:
-    st.session_state.study_df = None
-if "report_text" not in st.session_state:
-    st.session_state.report_text = ""
+    if "result" not in st.session_state:
+        st.session_state.result = None
+    if "report" not in st.session_state:
+        st.session_state.report = ""
 
-left_col, right_col = st.columns([1.0, 2.2], gap="medium")
+    inp = streamlit_input_panel()
 
-with left_col:
-    inp, axis = streamlit_input_panel()
-    b1, b2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        analyze = st.button("Analyze")
+    with col2:
+        show_modes = st.button("Show 5 Modes")
+    with col3:
+        clear_btn = st.button("Clear Results")
 
-    with b1:
-        if st.button("ANALYZE / REDESIGN"):
-            try:
-                with st.spinner("Running integrated MDOF redesign..."):
-                    model, result, hist_df = redesign_with_outriggers(inp, axis=axis, max_iter=6, verbose=False)
-                    study_df = root_outrigger_study(
-                        replace_for_study(inp),
-                        candidate_stories=_candidate_stories(inp),
-                        counts=(0, 1, 2, 3),
-                        axis=axis,
-                        redesign=True,
-                    )
-                    st.session_state.designed_model = model
-                    st.session_state.analysis_result = result
-                    st.session_state.history_df = hist_df
-                    st.session_state.study_df = study_df
-                    st.session_state.report_text = build_report(inp, axis, model, result, hist_df)
-                st.success("Integrated analysis completed.")
-            except Exception as e:
-                st.error(f"Analysis failed: {e}")
+    if clear_btn:
+        st.session_state.result = None
+        st.session_state.report = ""
+        st.rerun()
 
-    with b2:
-        if st.session_state.report_text:
-            st.download_button(
-                "SAVE REPORT",
-                data=st.session_state.report_text.encode("utf-8"),
-                file_name="integrated_mdof_outrigger_report.txt",
-                mime="text/plain",
-            )
-        else:
-            st.button("SAVE REPORT", disabled=True)
+    if analyze:
+        try:
+            with st.spinner("Running iterative MDOF analysis..."):
+                res = run_design(inp)
+                st.session_state.result = res
+                st.session_state.report = build_report(res)
+            st.success(f"Analysis completed in {len(res.iteration_history)} iterations.")
+        except Exception as exc:
+            st.exception(exc)
 
-with right_col:
-    if st.session_state.analysis_result is None:
-        st.info("Run ANALYZE / REDESIGN to generate the new integrated results.")
-    else:
-        model = st.session_state.designed_model
-        result = st.session_state.analysis_result
-        hist_df = st.session_state.history_df
-        study_df = st.session_state.study_df
+    if show_modes and st.session_state.result is None:
+        try:
+            with st.spinner("Running analysis first..."):
+                res = run_design(inp)
+                st.session_state.result = res
+                st.session_state.report = build_report(res)
+        except Exception as exc:
+            st.exception(exc)
+
+    result = st.session_state.result
+    if result is None:
+        st.warning("Enter data and click Analyze.")
+        return
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "Summary", "Iteration", "Modes", "Plan", "Report"
+    ])
+
+    with tab1:
+        st.subheader("Summary")
+        st.dataframe(result_summary_table(result), use_container_width=True)
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("T1 (s)", f"{result.periods[0]:.3f}")
-        c2.metric("T2 (s)", f"{result.periods[1]:.3f}" if len(result.periods) > 1 else "-")
-        c3.metric("Max drift ratio", f"{result.max_drift_ratio_unit_profile:.5f}")
-        c4.metric("Outriggers", len(result.outriggers))
+        c1.metric("T_est (s)", f"{result.estimated_period_s:.3f}")
+        c2.metric("T_target (s)", f"{result.design_target_period_s:.3f}")
+        c3.metric("Drift ratio", f"{result.drift_ratio:.5f}")
+        c4.metric("Weight (kN)", f"{result.total_weight_kN:,.0f}")
 
-        d1, d2, d3 = st.columns(3)
-        d1.metric("Perim. column", f"{model.perimeter_column.b:.2f} x {model.perimeter_column.h:.2f} m")
-        d2.metric("Corner column", f"{model.corner_column.b:.2f} x {model.corner_column.h:.2f} m")
-        d3.metric("Core thickness", f"{model.core.thickness:.2f} m")
+        if result.redesign_suggestions:
+            st.subheader("Redesign suggestions")
+            for item in result.redesign_suggestions:
+                st.write(f"- {item}")
 
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(
-            ["Plan / Elevation", "Modes", "Design History", "0-3 Outrigger Study", "Report"]
+    with tab2:
+        st.subheader("Iteration history")
+        df_iter = iteration_table(result)
+        st.dataframe(df_iter, use_container_width=True)
+        fig_iter = plot_iteration_history(result)
+        st.pyplot(fig_iter)
+
+        csv_iter = df_iter.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download iteration CSV",
+            data=csv_iter,
+            file_name="iteration_history.csv",
+            mime="text/csv",
         )
 
-        with tab1:
-            a, b = st.columns(2)
-            with a:
-                st.pyplot(plot_plan(model, axis=axis), use_container_width=True)
-            with b:
-                st.pyplot(plot_elevation(model), use_container_width=True)
+    with tab3:
+        st.subheader("Mode shapes")
+        fig_modes = plot_mode_shapes(result, modes=5)
+        st.pyplot(fig_modes)
 
-        with tab2:
-            st.pyplot(plot_modes(result, n_modes=5), use_container_width=True)
+    with tab4:
+        st.subheader("Plan view")
+        zone_options = [z.zone.name for z in result.zone_core_results]
+        zone_name = st.selectbox("Zone", zone_options, index=0)
+        fig_plan = plot_plan(result, inp, zone_name=zone_name)
+        st.pyplot(fig_plan)
 
-        with tab3:
-            if hist_df is not None and not hist_df.empty:
-                st.pyplot(plot_design_history(hist_df), use_container_width=True)
-                st.dataframe(hist_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("No iteration history available.")
+    with tab5:
+        st.subheader("Report")
+        st.text_area("Text report", st.session_state.report, height=500)
+        st.download_button(
+            "Download report as TXT",
+            data=st.session_state.report,
+            file_name="tall_building_report.txt",
+            mime="text/plain",
+        )
 
-        with tab4:
-            if study_df is not None and not study_df.empty:
-                st.dataframe(study_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("Study table not available.")
 
-        with tab5:
-            st.text_area("", st.session_state.report_text, height=520, label_visibility="collapsed")
+if __name__ == "__main__":
+    main()
