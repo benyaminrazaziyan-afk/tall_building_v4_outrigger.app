@@ -1,4 +1,9 @@
+
 from __future__ import annotations
+
+# Jupyter-safe backend
+import matplotlib
+matplotlib.use("Agg")
 
 from dataclasses import dataclass, field, replace
 from math import pi, sqrt
@@ -7,11 +12,6 @@ from typing import List, Sequence
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-
-try:
-    from scipy.linalg import eigh
-except Exception as exc:  # pragma: no cover
-    raise ImportError("scipy is required for generalized eigenvalue solution") from exc
 
 G = 9.81
 
@@ -156,23 +156,22 @@ class AnalysisResult:
     outriggers: List[OutriggerMechanics]
     floor_displacements: np.ndarray
     story_drifts: np.ndarray
-    outrigger_axial_by_level: dict[int, float]
+    outrigger_axial_by_level: dict
     max_drift_ratio: float
     base_shear: float
     input_model: TowerInput
 
 
-@dataclass
-class DesignIterationResult:
-    iteration: int
-    period_1: float
-    perimeter_col_b: float
-    perimeter_col_h: float
-    corner_col_b: float
-    corner_col_h: float
-    core_thickness: float
-    max_outrigger_axial_kN: float
-    max_drift_ratio: float
+def generalized_eigh(K: np.ndarray, M: np.ndarray):
+    m = np.diag(M).astype(float)
+    if np.any(m <= 0):
+        raise ValueError("Mass matrix must be positive diagonal.")
+    A = K / m[:, None]
+    vals, vecs = np.linalg.eig(A)
+    vals = np.real(vals)
+    vecs = np.real(vecs)
+    idx = np.argsort(vals)
+    return vals[idx], vecs[:, idx]
 
 
 def _ensure_vector_mass(inp: TowerInput) -> np.ndarray:
@@ -251,20 +250,10 @@ def outrigger_mechanics(inp: TowerInput, ou: OutriggerLevel) -> OutriggerMechani
     k_tip = 1.0 / (1.0 / max(k_truss_tip, 1e-12) + 1.0 / max(k_col_tip, 1e-12))
     k_rot = 2.0 * k_tip * arm**2
     distributed_story_stiffness = k_rot / max(ou.story * inp.story_height**2, 1e-12)
-    return OutriggerMechanics(
-        story=ou.story,
-        axis=axis,
-        arm=arm,
-        k_truss_tip=k_truss_tip,
-        k_column_tip=k_col_tip,
-        k_tip_combined=k_tip,
-        k_rot=k_rot,
-        distributed_story_stiffness=distributed_story_stiffness,
-        axial_force_per_side=0.0,
-    )
+    return OutriggerMechanics(ou.story, axis, arm, k_truss_tip, k_col_tip, k_tip, k_rot, distributed_story_stiffness, 0.0)
 
 
-def _triangular_lateral_force(inp: TowerInput) -> tuple[np.ndarray, float]:
+def _triangular_lateral_force(inp: TowerInput):
     masses = _ensure_vector_mass(inp)
     weights = masses * G
     Vb = inp.design_base_shear_ratio * weights.sum()
@@ -281,7 +270,7 @@ def analyze_tower(inp: TowerInput, axis: str = "x") -> AnalysisResult:
     k_cols = _story_stiffness_from_columns(inp, axis)
     k_total = k_core + k_cols
 
-    ou_mech: List[OutriggerMechanics] = []
+    ou_mech = []
     for ou in inp.outriggers:
         if ou.axis.lower() == axis:
             mech = outrigger_mechanics(inp, ou)
@@ -290,7 +279,7 @@ def analyze_tower(inp: TowerInput, axis: str = "x") -> AnalysisResult:
 
     K = _assemble_shear_building_K(k_total)
     M = _assemble_diagonal_mass(m)
-    w2, phi = eigh(K, M)
+    w2, phi = generalized_eigh(K, M)
     mask = w2 > 1e-9
     w = np.sqrt(w2[mask])
     phi = phi[:, mask]
@@ -319,204 +308,7 @@ def analyze_tower(inp: TowerInput, axis: str = "x") -> AnalysisResult:
         ou_axial[j + 1] = axial
         updated.append(replace(mech, axial_force_per_side=axial))
 
-    return AnalysisResult(
-        periods=periods,
-        frequencies=freqs,
-        mode_shapes=phi_n,
-        mass_matrix=M,
-        stiffness_matrix=K,
-        story_stiffness_base=k_core + k_cols,
-        story_stiffness_total=k_total,
-        outriggers=updated,
-        floor_displacements=u,
-        story_drifts=drift,
-        outrigger_axial_by_level=ou_axial,
-        max_drift_ratio=max_drift,
-        base_shear=Vb,
-        input_model=inp,
-    )
-
-
-def _update_perimeter_columns(inp: TowerInput, result: AnalysisResult, min_dim: float = 0.80, max_dim: float = 2.20) -> ColumnSection:
-    Nmax = max(result.outrigger_axial_by_level.values(), default=0.0)
-    if Nmax <= 1.0:
-        return inp.perimeter_column
-    fy = inp.column_material.fy
-    demand_area = 1.15 * Nmax / max(0.40 * fy, 1e-12)
-    target_a = max(inp.perimeter_column.area, demand_area)
-    side = min(max_dim, max(min_dim, sqrt(target_a)))
-    return ColumnSection(side, side, inp.perimeter_column.cracked_factor)
-
-
-def _update_corner_columns(inp: TowerInput, perimeter_col: ColumnSection, min_dim: float = 0.90, max_dim: float = 2.40) -> ColumnSection:
-    target_a = max(inp.corner_column.area, 1.15 * perimeter_col.area)
-    side = min(max_dim, max(min_dim, sqrt(target_a)))
-    return ColumnSection(side, side, inp.corner_column.cracked_factor)
-
-
-def _update_core(inp: TowerInput, result: AnalysisResult, max_drift_ratio_target: float = 1 / 500.0) -> CoreWallSection:
-    if result.max_drift_ratio <= max_drift_ratio_target:
-        return inp.core
-    ratio = min(max(result.max_drift_ratio / max(max_drift_ratio_target, 1e-12), 1.0), 1.20)
-    new_t = min(inp.core.thickness * sqrt(ratio), 1.50)
-    return replace(inp.core, thickness=new_t)
-
-
-def redesign_with_outriggers(inp: TowerInput, axis: str = "x", max_iter: int = 6, verbose: bool = False):
-    model = replace(inp)
-    history = []
-    for it in range(1, max_iter + 1):
-        res = analyze_tower(model, axis)
-        new_per = _update_perimeter_columns(model, res)
-        new_cor = _update_corner_columns(model, new_per)
-        tmp = replace(model, perimeter_column=new_per, corner_column=new_cor)
-        res_tmp = analyze_tower(tmp, axis)
-        new_core = _update_core(tmp, res_tmp)
-        new_model = replace(tmp, core=new_core)
-
-        history.append(DesignIterationResult(
-            iteration=it,
-            period_1=float(res.periods[0]),
-            perimeter_col_b=model.perimeter_column.b,
-            perimeter_col_h=model.perimeter_column.h,
-            corner_col_b=model.corner_column.b,
-            corner_col_h=model.corner_column.h,
-            core_thickness=model.core.thickness,
-            max_outrigger_axial_kN=max(res.outrigger_axial_by_level.values(), default=0.0) / 1e3,
-            max_drift_ratio=res.max_drift_ratio,
-        ))
-
-        if verbose:
-            print(
-                f"it={it:02d}, T1={res.periods[0]:.3f} s, "
-                f"PerCol={model.perimeter_column.b:.2f}x{model.perimeter_column.h:.2f} m, "
-                f"Core t={model.core.thickness:.2f} m, "
-                f"N_ou,max={max(res.outrigger_axial_by_level.values(), default=0.0)/1e3:.1f} kN"
-            )
-
-        diffs = [
-            abs(new_model.perimeter_column.area - model.perimeter_column.area) / max(model.perimeter_column.area, 1e-12),
-            abs(new_model.corner_column.area - model.corner_column.area) / max(model.corner_column.area, 1e-12),
-            abs(new_model.core.thickness - model.core.thickness) / max(model.core.thickness, 1e-12),
-        ]
-        model = new_model
-        if max(diffs) < 0.01:
-            break
-
-    final = analyze_tower(model, axis)
-    hist_df = pd.DataFrame([x.__dict__ for x in history])
-    return model, final, hist_df
-
-
-def root_outrigger_study(base_inp: TowerInput, candidate_stories: Sequence[int], counts: Sequence[int] = (0, 1, 2, 3), axis: str = "x", redesign: bool = True) -> pd.DataFrame:
-    rows = []
-    template_ou = OutriggerLevel(story=1, axis=axis)
-    for c in counts:
-        levels = [replace(template_ou, story=int(s), axis=axis) for s in list(candidate_stories)[:c]]
-        inp = replace(base_inp, outriggers=levels)
-        if redesign:
-            model, res, _ = redesign_with_outriggers(inp, axis=axis, max_iter=6, verbose=False)
-        else:
-            model, res = inp, analyze_tower(inp, axis=axis)
-        rows.append({
-            "n_outriggers": c,
-            "stories": [ou.story for ou in model.outriggers],
-            "T1_s": float(res.periods[0]),
-            "roof_disp_mm": float(res.floor_displacements[-1] * 1e3),
-            "max_drift_ratio": float(res.max_drift_ratio),
-            "perimeter_col_m": f"{model.perimeter_column.b:.2f} x {model.perimeter_column.h:.2f}",
-            "corner_col_m": f"{model.corner_column.b:.2f} x {model.corner_column.h:.2f}",
-            "core_t_m": model.core.thickness,
-            "max_outrigger_axial_kN": max(res.outrigger_axial_by_level.values(), default=0.0) / 1e3,
-        })
-    return pd.DataFrame(rows)
-
-
-def _column_points(inp: TowerInput):
-    xs = np.linspace(0.0, inp.plan_x, inp.n_perimeter_columns_x_face + 2)[1:-1]
-    ys = np.linspace(0.0, inp.plan_y, inp.n_perimeter_columns_y_face + 2)[1:-1]
-    pts = []
-    for x in xs:
-        pts.extend([(x, 0.0), (x, inp.plan_y)])
-    for y in ys:
-        pts.extend([(0.0, y), (inp.plan_x, y)])
-    pts.extend([(0.0, 0.0), (inp.plan_x, 0.0), (0.0, inp.plan_y), (inp.plan_x, inp.plan_y)])
-    return pts
-
-
-def plot_plan(inp: TowerInput, axis: str = "x", figsize=(8, 8)):
-    fig, ax = plt.subplots(figsize=figsize)
-    ax.plot([0, inp.plan_x, inp.plan_x, 0, 0], [0, 0, inp.plan_y, inp.plan_y, 0], lw=2)
-    cx0 = 0.5 * (inp.plan_x - inp.core.length_x)
-    cy0 = 0.5 * (inp.plan_y - inp.core.length_y)
-    ax.add_patch(plt.Rectangle((cx0, cy0), inp.core.length_x, inp.core.length_y, fill=False, lw=2))
-    pts = np.array(_column_points(inp))
-    ax.scatter(pts[:, 0], pts[:, 1], s=30)
-
-    if axis.lower() == "x":
-        ymid = inp.plan_y / 2.0
-        ax.plot([cx0, 0.0], [ymid, ymid], lw=3)
-        ax.plot([cx0 + inp.core.length_x, inp.plan_x], [ymid, ymid], lw=3)
-    else:
-        xmid = inp.plan_x / 2.0
-        ax.plot([xmid, xmid], [cy0, 0.0], lw=3)
-        ax.plot([xmid, xmid], [cy0 + inp.core.length_y, inp.plan_y], lw=3)
-
-    ax.set_aspect("equal")
-    ax.set_title("Plan view: perimeter columns, core walls, and outrigger axis")
-    ax.set_xlabel("X (m)")
-    ax.set_ylabel("Y (m)")
-    ax.grid(True, alpha=0.25)
-    return fig, ax
-
-
-def plot_elevation(inp: TowerInput, figsize=(7, 9)):
-    fig, ax = plt.subplots(figsize=figsize)
-    H = inp.height()
-    x_core_left, x_core_right = 0.35, 0.65
-    x_col_left, x_col_right = 0.05, 0.95
-    ax.plot([x_col_left, x_col_left], [0, H], lw=1.5)
-    ax.plot([x_col_right, x_col_right], [0, H], lw=1.5)
-    ax.plot([x_core_left, x_core_left], [0, H], lw=3)
-    ax.plot([x_core_right, x_core_right], [0, H], lw=3)
-    for i in range(inp.n_story + 1):
-        z = i * inp.story_height
-        ax.plot([x_col_left, x_col_right], [z, z], lw=0.35, alpha=0.35)
-    for ou in inp.outriggers:
-        z = ou.story * inp.story_height
-        ax.plot([x_core_left, x_col_left], [z, z], lw=2.5)
-        ax.plot([x_core_right, x_col_right], [z, z], lw=2.5)
-        ax.text(1.0, z, f"Outrigger @ story {ou.story}", va="center")
-    ax.set_title("Elevation view: core, perimeter columns, and outrigger levels")
-    ax.set_xlabel("schematic width")
-    ax.set_ylabel("Height (m)")
-    ax.grid(True, alpha=0.25)
-    return fig, ax
-
-
-def plot_modes(result: AnalysisResult, n_modes: int = 3):
-    n_modes = min(n_modes, result.mode_shapes.shape[1])
-    z = np.arange(1, result.input_model.n_story + 1) * result.input_model.story_height
-    fig, ax = plt.subplots(figsize=(6, 8))
-    for i in range(n_modes):
-        ax.plot(result.mode_shapes[:, i], z, label=f"Mode {i+1} (T={result.periods[i]:.3f} s)")
-    ax.axvline(0.0, color="k", lw=0.8)
-    ax.set_xlabel("Normalized modal displacement")
-    ax.set_ylabel("Height (m)")
-    ax.set_title("Mode shapes")
-    ax.grid(True, alpha=0.25)
-    ax.legend()
-    return fig, ax
-
-
-def plot_design_history(hist_df: pd.DataFrame):
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(hist_df["iteration"], hist_df["period_1"], marker="o")
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("T1 (s)")
-    ax.set_title("Redesign history")
-    ax.grid(True, alpha=0.25)
-    return fig, ax
+    return AnalysisResult(periods, freqs, phi_n, M, K, k_core + k_cols, k_total, updated, u, drift, ou_axial, max_drift, Vb, inp)
 
 
 def example_input() -> TowerInput:
@@ -538,26 +330,17 @@ def example_input() -> TowerInput:
     )
 
 
-def example_usage():
+def quick_demo():
     inp = example_input()
-    print("=== Bare tower ===")
-    bare = analyze_tower(inp, axis="x")
-    print(f"T1 = {bare.periods[0]:.3f} s")
-    print(f"Roof displacement = {bare.floor_displacements[-1]*1e3:.1f} mm")
-
-    print("\n=== Tower with outriggers at 15, 30, 45 ===")
-    inp2 = replace(inp, outriggers=[OutriggerLevel(15, "x"), OutriggerLevel(30, "x"), OutriggerLevel(45, "x")])
-    model2, res2, hist = redesign_with_outriggers(inp2, axis="x", max_iter=6, verbose=True)
-    print(f"Final T1 = {res2.periods[0]:.3f} s")
-    print(f"Final perimeter column = {model2.perimeter_column.b:.2f} x {model2.perimeter_column.h:.2f} m")
-    print(f"Final core thickness = {model2.core.thickness:.2f} m")
-    print(f"Max outrigger axial = {max(res2.outrigger_axial_by_level.values(), default=0.0)/1e3:.1f} kN")
-
-    study = root_outrigger_study(inp, candidate_stories=[15, 30, 45], counts=(0, 1, 2, 3), axis="x", redesign=True)
-    print("\n=== Comparison study ===")
-    print(study.to_string(index=False))
-    return inp, bare, model2, res2, hist, study
+    inp.outriggers = [OutriggerLevel(15, "x"), OutriggerLevel(30, "x"), OutriggerLevel(45, "x")]
+    res = analyze_tower(inp, axis="x")
+    return {
+        "T1_s": float(res.periods[0]),
+        "roof_disp_mm": float(res.floor_displacements[-1] * 1000.0),
+        "max_drift_ratio": float(res.max_drift_ratio),
+        "max_outrigger_axial_kN": float(max(res.outrigger_axial_by_level.values(), default=0.0) / 1000.0),
+    }
 
 
 if __name__ == "__main__":
-    example_usage()
+    print(quick_demo())
