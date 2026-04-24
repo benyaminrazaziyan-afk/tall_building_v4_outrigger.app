@@ -1411,6 +1411,14 @@ def build_report(res: DesignResult) -> str:
     lines.append("-" * 96)
     lines.append(final_dimensions_table(res).to_string(index=False))
     lines.append("")
+    lines.append("3B. Outrigger design")
+    lines.append("-" * 96)
+    lines.append(outrigger_design_table(res).to_string(index=False))
+    lines.append("")
+    lines.append("3C. Design checks")
+    lines.append("-" * 96)
+    lines.append(design_check_table(res).to_string(index=False))
+    lines.append("")
     lines.append("4. Modal X")
     lines.append("-" * 96)
     lines.append(modal_table(res.modal_x).to_string(index=False))
@@ -1424,6 +1432,113 @@ def build_report(res: DesignResult) -> str:
     lines.append("This file is suitable for preliminary structural system comparison and thesis-level methodology discussion.")
     lines.append("It is not a final code-design replacement for ETABS because 3D torsion, accidental eccentricity, P-Delta, diaphragm modeling, detailed member design, and load combinations are still required.")
     return "\n".join(lines)
+
+
+
+# ============================================================
+# 9B. OUTRIGGER DESIGN AND CHECK TABLES
+# ============================================================
+
+def outrigger_design_table(res: DesignResult) -> pd.DataFrame:
+    inp = res.input
+    rows = []
+    if inp.outrigger_system == OutriggerSystem.NONE or len(inp.outrigger_story_levels) == 0:
+        return pd.DataFrame([{"Item": "Outrigger system", "Value": "No outrigger defined", "Unit": "-"}])
+
+    for lev in inp.outrigger_story_levels:
+        idx = min(max(int(lev), 1), inp.n_story) - 1
+        sec = res.sections[idx]
+        prop = res.properties[idx]
+        arm_x = max((inp.plan_x - sec.core_x) / 2.0, 1.0)
+        arm_y = max((inp.plan_y - sec.core_y) / 2.0, 1.0)
+
+        if inp.outrigger_system == OutriggerSystem.TUBULAR_BRACE:
+            area = tube_area(inp.tubular_diameter_m, inp.tubular_thickness_m)
+            Lx = sqrt(arm_x**2 + inp.outrigger_depth_m**2)
+            Ly = sqrt(arm_y**2 + inp.outrigger_depth_m**2)
+            kax_x = 2.0 * inp.braced_spans_x * inp.Ec * 1e6 * area / Lx
+            kax_y = 2.0 * inp.braced_spans_y * inp.Ec * 1e6 * area / Ly
+            steel_x = 2.0 * inp.braced_spans_x * area * Lx * RHO_STEEL
+            steel_y = 2.0 * inp.braced_spans_y * area * Ly * RHO_STEEL
+
+            rows.append({
+                "Outrigger story": lev,
+                "System": inp.outrigger_system.value,
+                "Arm X (m)": arm_x,
+                "Arm Y (m)": arm_y,
+                "Brace D (m)": inp.tubular_diameter_m,
+                "Brace t (m)": inp.tubular_thickness_m,
+                "Brace area (m²)": area,
+                "Brace length X (m)": Lx,
+                "Brace length Y (m)": Ly,
+                "Braced spans X": inp.braced_spans_x,
+                "Braced spans Y": inp.braced_spans_y,
+                "Axial stiffness X (MN/m)": kax_x / 1e6,
+                "Axial stiffness Y (MN/m)": kax_y / 1e6,
+                "Ktheta X (GN.m/rad)": prop.Ktheta_out_x_Nm / 1e9,
+                "Ktheta Y (GN.m/rad)": prop.Ktheta_out_y_Nm / 1e9,
+                "Steel X-dir (kg)": steel_x,
+                "Steel Y-dir (kg)": steel_y,
+                "Total steel at level (kg)": steel_x + steel_y,
+            })
+        else:
+            Lx = sqrt(arm_x**2 + inp.outrigger_depth_m**2)
+            Ly = sqrt(arm_y**2 + inp.outrigger_depth_m**2)
+            steel_x = 2.0 * inp.braced_spans_x * (inp.outrigger_chord_area_m2 + inp.outrigger_diagonal_area_m2) * Lx * RHO_STEEL
+            steel_y = 2.0 * inp.braced_spans_y * (inp.outrigger_chord_area_m2 + inp.outrigger_diagonal_area_m2) * Ly * RHO_STEEL
+            rows.append({
+                "Outrigger story": lev,
+                "System": inp.outrigger_system.value,
+                "Arm X (m)": arm_x,
+                "Arm Y (m)": arm_y,
+                "Truss depth (m)": inp.outrigger_depth_m,
+                "Chord area (m²)": inp.outrigger_chord_area_m2,
+                "Diagonal area (m²)": inp.outrigger_diagonal_area_m2,
+                "Braced spans X": inp.braced_spans_x,
+                "Braced spans Y": inp.braced_spans_y,
+                "Ktheta X (GN.m/rad)": prop.Ktheta_out_x_Nm / 1e9,
+                "Ktheta Y (GN.m/rad)": prop.Ktheta_out_y_Nm / 1e9,
+                "Steel X-dir (kg)": steel_x,
+                "Steel Y-dir (kg)": steel_y,
+                "Total steel at level (kg)": steel_x + steel_y,
+            })
+
+    return pd.DataFrame(rows)
+
+
+def design_check_table(res: DesignResult) -> pd.DataFrame:
+    max_drift_x = float(np.max(res.rsa_x.drift_ratio))
+    max_drift_y = float(np.max(res.rsa_y.drift_ratio))
+    mass_x = res.modal_x.cumulative_mass_ratios[-1] if res.modal_x.cumulative_mass_ratios else 0.0
+    mass_y = res.modal_y.cumulative_mass_ratios[-1] if res.modal_y.cumulative_mass_ratios else 0.0
+    return pd.DataFrame([
+        {"Check": "X-direction drift", "Demand": max_drift_x, "Limit": res.input.drift_limit_ratio, "Status": "OK" if max_drift_x <= res.input.drift_limit_ratio else "NOT OK"},
+        {"Check": "Y-direction drift", "Demand": max_drift_y, "Limit": res.input.drift_limit_ratio, "Status": "OK" if max_drift_y <= res.input.drift_limit_ratio else "NOT OK"},
+        {"Check": "X modal mass participation", "Demand": mass_x, "Limit": res.input.minimum_modal_mass_ratio, "Status": "OK" if mass_x >= res.input.minimum_modal_mass_ratio else "NOT OK"},
+        {"Check": "Y modal mass participation", "Demand": mass_y, "Limit": res.input.minimum_modal_mass_ratio, "Status": "OK" if mass_y >= res.input.minimum_modal_mass_ratio else "NOT OK"},
+        {"Check": "X RSA base shear scaling", "Demand": res.rsa_x.base_shear_unscaled_kN, "Limit": res.input.asce7.rsa_min_ratio_to_elf * res.rsa_x.elf_base_shear_kN, "Status": "SCALED" if res.rsa_x.rsa_scale_factor > 1.0001 else "OK"},
+        {"Check": "Y RSA base shear scaling", "Demand": res.rsa_y.base_shear_unscaled_kN, "Limit": res.input.asce7.rsa_min_ratio_to_elf * res.rsa_y.elf_base_shear_kN, "Status": "SCALED" if res.rsa_y.rsa_scale_factor > 1.0001 else "OK"},
+    ])
+
+
+def final_design_dashboard_table(res: DesignResult) -> pd.DataFrame:
+    lower = res.sections[0]
+    mid = res.sections[len(res.sections)//2]
+    top = res.sections[-1]
+    q_conc = sum(p.concrete_m3 for p in res.properties)
+    q_steel = sum(p.steel_kg for p in res.properties)
+    return pd.DataFrame([
+        {"Component": "Central core", "Lower": f"{lower.core_x:.2f} x {lower.core_y:.2f} m", "Middle": f"{mid.core_x:.2f} x {mid.core_y:.2f} m", "Upper": f"{top.core_x:.2f} x {top.core_y:.2f} m"},
+        {"Component": "Core wall thickness", "Lower": f"{lower.core_wall_t:.2f} m", "Middle": f"{mid.core_wall_t:.2f} m", "Upper": f"{top.core_wall_t:.2f} m"},
+        {"Component": "Side wall thickness", "Lower": f"{lower.side_wall_t:.2f} m", "Middle": f"{mid.side_wall_t:.2f} m", "Upper": f"{top.side_wall_t:.2f} m"},
+        {"Component": "Interior columns", "Lower": f"{lower.column_interior_x:.2f} x {lower.column_interior_y:.2f} m", "Middle": f"{mid.column_interior_x:.2f} x {mid.column_interior_y:.2f} m", "Upper": f"{top.column_interior_x:.2f} x {top.column_interior_y:.2f} m"},
+        {"Component": "Perimeter columns", "Lower": f"{lower.column_perimeter_x:.2f} x {lower.column_perimeter_y:.2f} m", "Middle": f"{mid.column_perimeter_x:.2f} x {mid.column_perimeter_y:.2f} m", "Upper": f"{top.column_perimeter_x:.2f} x {top.column_perimeter_y:.2f} m"},
+        {"Component": "Corner columns", "Lower": f"{lower.column_corner_x:.2f} x {lower.column_corner_y:.2f} m", "Middle": f"{mid.column_corner_x:.2f} x {mid.column_corner_y:.2f} m", "Upper": f"{top.column_corner_x:.2f} x {top.column_corner_y:.2f} m"},
+        {"Component": "Beams", "Lower": f"{lower.beam_b:.2f} x {lower.beam_h:.2f} m", "Middle": f"{mid.beam_b:.2f} x {mid.beam_h:.2f} m", "Upper": f"{top.beam_b:.2f} x {top.beam_h:.2f} m"},
+        {"Component": "Slab", "Lower": f"{lower.slab_t:.2f} m", "Middle": f"{mid.slab_t:.2f} m", "Upper": f"{top.slab_t:.2f} m"},
+        {"Component": "Outrigger system", "Lower": res.input.outrigger_system.value, "Middle": f"Stories {list(res.input.outrigger_story_levels)}", "Upper": f"Braced spans X/Y = {res.input.braced_spans_x}/{res.input.braced_spans_y}"},
+        {"Component": "Quantities", "Lower": f"Concrete = {q_conc:,.0f} m³", "Middle": f"Steel = {q_steel:,.0f} kg", "Upper": "-"},
+    ])
 
 
 # ============================================================
@@ -1720,6 +1835,9 @@ def main():
 
         tabs = st.tabs(
             [
+                "FINAL DESIGN",
+                "OUTRIGGER DESIGN",
+                "DESIGN CHECKS",
                 "Summary",
                 "Final dimensions",
                 "Plan",
@@ -1736,23 +1854,38 @@ def main():
         )
 
         with tabs[0]:
+            st.markdown("### Final preliminary design dimensions")
+            st.dataframe(final_design_dashboard_table(res), use_container_width=True, hide_index=True)
+            st.markdown("### Main design quantities")
             st.dataframe(summary_table(res), use_container_width=True, hide_index=True)
 
         with tabs[1]:
-            st.dataframe(final_dimensions_table(res), use_container_width=True, hide_index=True)
+            st.markdown("### Outrigger design result")
+            st.dataframe(outrigger_design_table(res), use_container_width=True, hide_index=True)
+            st.caption("Ktheta is the rotational restraint added to the flexural MDOF solver at the real outrigger levels.")
 
         with tabs[2]:
-            st.pyplot(plot_plan(res, zone_name), use_container_width=True)
+            st.markdown("### Design checks")
+            st.dataframe(design_check_table(res), use_container_width=True, hide_index=True)
 
         with tabs[3]:
+            st.dataframe(summary_table(res), use_container_width=True, hide_index=True)
+
+        with tabs[4]:
+            st.dataframe(final_dimensions_table(res), use_container_width=True, hide_index=True)
+
+        with tabs[5]:
+            st.pyplot(plot_plan(res, zone_name), use_container_width=True)
+
+        with tabs[6]:
             st.pyplot(plot_modes(res, Direction.X), use_container_width=True)
             st.dataframe(modal_table(res.modal_x), use_container_width=True, hide_index=True)
 
-        with tabs[4]:
+        with tabs[7]:
             st.pyplot(plot_modes(res, Direction.Y), use_container_width=True)
             st.dataframe(modal_table(res.modal_y), use_container_width=True, hide_index=True)
 
-        with tabs[5]:
+        with tabs[8]:
             p1, p2 = st.columns(2)
             with p1:
                 st.pyplot(plot_story_response(res, Direction.X, "Story shear"), use_container_width=True)
@@ -1760,7 +1893,7 @@ def main():
                 st.pyplot(plot_story_response(res, Direction.X, "Drift ratio"), use_container_width=True)
             st.dataframe(story_response_table(res, Direction.X), use_container_width=True, hide_index=True)
 
-        with tabs[6]:
+        with tabs[9]:
             p1, p2 = st.columns(2)
             with p1:
                 st.pyplot(plot_story_response(res, Direction.Y, "Story shear"), use_container_width=True)
@@ -1768,27 +1901,27 @@ def main():
                 st.pyplot(plot_story_response(res, Direction.Y, "Drift ratio"), use_container_width=True)
             st.dataframe(story_response_table(res, Direction.Y), use_container_width=True, hide_index=True)
 
-        with tabs[7]:
+        with tabs[10]:
             st.pyplot(plot_stiffness(res), use_container_width=True)
             st.dataframe(stiffness_table(res), use_container_width=True, hide_index=True)
 
-        with tabs[8]:
+        with tabs[11]:
             st.pyplot(plot_spectrum(res.input), use_container_width=True)
             st.dataframe(spectrum_table(res.input), use_container_width=True, hide_index=True)
 
-        with tabs[9]:
+        with tabs[12]:
             fig = plot_iteration(res)
             if fig is not None:
                 st.pyplot(fig, use_container_width=True)
             st.dataframe(res.iteration_table, use_container_width=True, hide_index=True)
 
-        with tabs[10]:
+        with tabs[13]:
             st.markdown("### Story sections")
             st.dataframe(pd.DataFrame([s.__dict__ for s in res.sections]), use_container_width=True, hide_index=True)
             st.markdown("### Story properties")
             st.dataframe(pd.DataFrame([p.__dict__ for p in res.properties]), use_container_width=True, hide_index=True)
 
-        with tabs[11]:
+        with tabs[14]:
             st.text_area("Report", st.session_state.v13_report, height=600)
 
 
