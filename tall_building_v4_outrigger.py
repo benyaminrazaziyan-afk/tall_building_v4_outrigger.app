@@ -753,7 +753,7 @@ def solve_modal(stories: List[StoryResult], direction: Direction, n_modes: int =
     periods = [float(2 * pi / w) for w in omegas]
     freqs = [float(w / (2 * pi)) for w in omegas]
 
-    total_mass = float(np.sum(np.diag(M)))
+    total_mass = np.sum(np.diag(M)).item()
     ones = np.ones((len(stories), 1))
 
     mode_shapes = []
@@ -764,8 +764,8 @@ def solve_modal(stories: List[StoryResult], direction: Direction, n_modes: int =
     for i in range(n_modes):
         phi = eigvecs[:, i].reshape(-1, 1)
 
-        denom = float(phi.T @ M @ phi)
-        gamma = float((phi.T @ M @ ones) / denom)
+        denom = (phi.T @ M @ phi).item()
+        gamma = ((phi.T @ M @ ones) / denom).item()
         modal_mass = gamma**2 * denom
         ratio = modal_mass / total_mass
 
