@@ -177,6 +177,10 @@ class BuildingInput:
     tubular_thickness_m: float = 0.030
     braced_spans_x: int = 2
     braced_spans_y: int = 2
+    # Optional exact bay IDs. Bay i means the panel between grid lines i and i+1.
+    # If empty, centered bays are selected according to braced_spans_x/y.
+    braced_bay_ids_x: Tuple[int, ...] = ()  # X action: bay IDs along Y on E/W sides
+    braced_bay_ids_y: Tuple[int, ...] = ()  # Y action: bay IDs along X on N/S sides
     outrigger_connection_efficiency: float = 0.75
 
     # Criteria
@@ -670,17 +674,35 @@ def centered_bay_indices(n_bays: int, requested_count: int) -> Tuple[int, ...]:
     return tuple(range(start, start + requested_count))
 
 
+def clean_bay_ids(ids: Tuple[int, ...], n_bays: int, max_count: int | None = None) -> Tuple[int, ...]:
+    """Return valid, unique real bay IDs sorted increasingly."""
+    valid: List[int] = []
+    for raw in ids:
+        i = int(raw)
+        if 0 <= i < int(n_bays) and i not in valid:
+            valid.append(i)
+    if max_count is not None and max_count >= 0:
+        valid = valid[: int(max_count)]
+    return tuple(valid)
+
+
 def active_braced_bays(inp: BuildingInput, direction: Direction) -> Tuple[int, ...]:
     """
     Actual braced bay indices used both in stiffness and drawing.
 
-    Direction.X means lateral X response; braces are placed on the west/east
-    perimeter strips and selected by bay IDs along Y.
-    Direction.Y means lateral Y response; braces are placed on the south/north
-    perimeter strips and selected by bay IDs along X.
+    v27 rule:
+      1. If explicit bay IDs are entered, use those exact bay panels.
+      2. Otherwise select centered real grid bays from braced_spans_x/y.
+      3. Drawing, diagnostic table, and stiffness matrix use the same bay IDs.
     """
     if direction == Direction.X:
+        explicit = clean_bay_ids(inp.braced_bay_ids_x, inp.n_bays_y, inp.braced_spans_x)
+        if explicit:
+            return explicit
         return centered_bay_indices(inp.n_bays_y, inp.braced_spans_x)
+    explicit = clean_bay_ids(inp.braced_bay_ids_y, inp.n_bays_x, inp.braced_spans_y)
+    if explicit:
+        return explicit
     return centered_bay_indices(inp.n_bays_x, inp.braced_spans_y)
 
 
@@ -810,20 +832,39 @@ def outrigger_span_stiffness_components(inp: BuildingInput, sec: StorySection, d
 
 
 def outrigger_Klateral(inp: BuildingInput, sec: StorySection, direction: Direction) -> float:
-    """
-    Equivalent translational stiffness from the same summed brace stiffness.
-
-    A reduced stick model may hide part of the outrigger effect if only a nodal
-    rotational spring is used. Therefore the same K_out is also added as a
-    conservative translational coupling spring at the outrigger floor.
-    """
+    """Diagnostic K_uu term of the condensed outrigger stiffness matrix."""
     v = outrigger_span_basic_values(inp, sec, direction)
     k_out = v["k_out_total_N_per_m"]
     if k_out <= 0.0:
         return 0.0
     eta = max(min(outrigger_efficiency(inp.outrigger_system) * inp.outrigger_connection_efficiency, 1.0), 0.0)
-    translational_participation = 0.20
-    return float(translational_participation * eta * k_out)
+    return float(eta * k_out)
+
+
+def outrigger_coupled_matrix(inp: BuildingInput, sec: StorySection, direction: Direction) -> np.ndarray:
+    """
+    Condensed engineering stiffness added to the floor DOFs [u, theta].
+
+    The braced-bay stiffness follows the method requested from the sketch:
+        K_out = sum((E_s A_b / L_b) cos^2(theta_b))
+
+    Compatibility at the core floor is taken as:
+        delta = u_floor + lever_arm * theta_floor
+
+    So the energy U = 0.5 * eta * K_out * delta^2 gives:
+        K_add = eta K_out [[1, a], [a, a^2]]
+
+    This is intentionally different from the previous local spring treatment;
+    the off-diagonal terms make the outrigger participate in the global matrix.
+    """
+    v = outrigger_span_basic_values(inp, sec, direction)
+    k_out = v["k_out_total_N_per_m"]
+    a = v["lever_arm_m"]
+    if k_out <= 0.0 or a <= 0.0:
+        return np.zeros((2, 2), dtype=float)
+    eta = max(min(outrigger_efficiency(inp.outrigger_system) * inp.outrigger_connection_efficiency, 1.0), 0.0)
+    k = eta * k_out
+    return k * np.array([[1.0, a], [a, a * a]], dtype=float)
 
 def story_mass_and_quantities(inp: BuildingInput, sec: StorySection) -> Tuple[float, float, float, float]:
     A_floor = inp.floor_area
@@ -955,13 +996,16 @@ def assemble_flexural_mk(inp: BuildingInput, props: List[StoryProperties], direc
         M[u_dof, u_dof] += prop.mass_kg
         M[th_dof, th_dof] += prop.mass_kg * L**2 * 1e-5
 
-        Ktheta = prop.Ktheta_out_x_Nm if direction == Direction.X else prop.Ktheta_out_y_Nm
-        if Ktheta > 0:
-            K[th_dof, th_dof] += Ktheta
-
-        Klat = outrigger_Klateral(inp, sec, direction)
-        if Klat > 0:
-            K[u_dof, u_dof] += Klat
+        # v27 engineering insertion: condensed braced-bay outrigger matrix.
+        # The contribution is not only Ktheta; it includes Kuu and off-diagonal
+        # coupling terms from delta = u + lever_arm * theta, so it changes the
+        # global stiffness matrix and the modal period.
+        kout = outrigger_coupled_matrix(inp, sec, direction)
+        if np.any(kout):
+            dofs2 = [u_dof, th_dof]
+            for a_i in range(2):
+                for b_i in range(2):
+                    K[dofs2[a_i], dofs2[b_i]] += kout[a_i, b_i]
 
     free = list(range(2, ndof))  # base u and theta fixed
     return M[np.ix_(free, free)], K[np.ix_(free, free)]
@@ -2128,6 +2172,8 @@ def streamlit_input_panel() -> BuildingInput:
         outrigger_depth_m = st.number_input("Outrigger depth (m)", 1.0, 12.0, 3.0)
         braced_spans_x = st.number_input("Braced bays on each E/W side for X action", 0, 20, 2)
         braced_spans_y = st.number_input("Braced bays on each N/S side for Y action", 0, 20, 2)
+        braced_bay_ids_x_txt = st.text_input("Exact bay IDs for X action along Y (optional, comma-separated)", "")
+        braced_bay_ids_y_txt = st.text_input("Exact bay IDs for Y action along X (optional, comma-separated)", "")
     with c12:
         tubular_diameter_m = st.number_input("Tube diameter D (m)", 0.10, 3.0, 0.80)
         tubular_thickness_m = st.number_input("Tube thickness t (m)", 0.005, 0.20, 0.030)
@@ -2175,6 +2221,18 @@ def streamlit_input_panel() -> BuildingInput:
         max_iterations = st.number_input("Max redesign iterations", 1, 40, 12)
         growth_limit = st.number_input("Growth limit per iteration", 1.01, 1.50, 1.12)
         reduction_limit = st.number_input("Reduction limit per iteration", 0.70, 0.99, 0.96)
+
+    def _parse_bay_ids(txt: str) -> Tuple[int, ...]:
+        vals: List[int] = []
+        for part in str(txt).replace(";", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                vals.append(int(part))
+            except Exception:
+                pass
+        return tuple(vals)
 
     return BuildingInput(
         plan_shape=plan_shape,
@@ -2235,6 +2293,8 @@ def streamlit_input_panel() -> BuildingInput:
         tubular_thickness_m=float(tubular_thickness_m),
         braced_spans_x=int(braced_spans_x),
         braced_spans_y=int(braced_spans_y),
+        braced_bay_ids_x=_parse_bay_ids(braced_bay_ids_x_txt),
+        braced_bay_ids_y=_parse_bay_ids(braced_bay_ids_y_txt),
         outrigger_connection_efficiency=float(outrigger_connection_efficiency),
         drift_limit_ratio=float(drift_limit_ratio),
         minimum_modal_mass_ratio=float(minimum_modal_mass_ratio),
