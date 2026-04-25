@@ -16,7 +16,7 @@ Core features
 - Perimeter walls are drawn and included in the lateral stiffness model.
 - Optional below-grade retaining-wall stiffness contribution for basement levels.
 
-Author: Benyamin Rezazian
+Author: Benyamin Rezaziyan
 Version: 4.1
 """
 
