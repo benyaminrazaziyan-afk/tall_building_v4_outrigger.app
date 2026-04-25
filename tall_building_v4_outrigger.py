@@ -44,7 +44,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
-APP_VERSION = "v13.0-professional-flexural-MDOF"
+APP_VERSION = "v14.0-ASCE-compliant-drift-controlled-MDOF"
 G = 9.81
 RHO_STEEL = 7850.0
 
@@ -993,14 +993,29 @@ def evaluate(inp: BuildingInput, wall_scale: float = 1.0, col_scale: float = 1.0
 
 
 def run_design(inp: BuildingInput) -> DesignResult:
+    """
+    ASCE-compliant preliminary redesign logic.
+
+    Key rule:
+        The model does NOT redesign to hit a target period.
+        T_modal is computed from [K]phi = omega²[M]phi.
+        Base shear uses ASCE ELF period control:
+            T_used = min(T_modal, Cu*Ta)
+        RSA forces are scaled to the required ELF minimum.
+        Redesign is governed by:
+            1. design drift ratio
+            2. modal mass participation
+            3. practical member-size bounds
+            4. not period matching
+    """
     if not inp.auto_redesign:
         return evaluate(inp)
 
     wall_scale = 1.0
     col_scale = 1.0
     slab_scale = 1.0
-    logs = []
 
+    logs = []
     best = None
     best_score = 1e99
 
@@ -1018,13 +1033,18 @@ def run_design(inp: BuildingInput) -> DesignResult:
         total_concrete = sum(p.concrete_m3 for p in res.properties)
         total_steel = sum(p.steel_kg for p in res.properties)
 
-        drift_over = max(max_drift / max(inp.drift_limit_ratio, 1e-9), 1.0)
-        mass_deficit = max(inp.minimum_modal_mass_ratio - min_mass, 0.0)
+        drift_ratio_over = max_drift / max(inp.drift_limit_ratio, 1e-12)
+        drift_excess = max(drift_ratio_over - 1.0, 0.0)
+        drift_too_low = max(0.35 - drift_ratio_over, 0.0)
 
+        modal_mass_deficit = max(inp.minimum_modal_mass_ratio - min_mass, 0.0)
+
+        # Penalize unsafe drift strongly; penalize excessive stiffness mildly.
         score = (
-            1000.0 * max(drift_over - 1.0, 0.0) ** 2
-            + 300.0 * mass_deficit ** 2
-            + 0.000001 * total_concrete
+            2000.0 * drift_excess**2
+            + 300.0 * modal_mass_deficit**2
+            + 20.0 * drift_too_low**2
+            + 0.0000010 * total_concrete
             + 0.0000002 * total_steel
         )
 
@@ -1034,15 +1054,23 @@ def run_design(inp: BuildingInput) -> DesignResult:
                 "Wall scale": wall_scale,
                 "Column scale": col_scale,
                 "Slab/beam scale": slab_scale,
-                "T1 X (s)": res.modal_x.periods_s[0],
-                "T1 Y (s)": res.modal_y.periods_s[0],
+                "T_modal X (s)": res.modal_x.periods_s[0],
+                "T_modal Y (s)": res.modal_y.periods_s[0],
+                "Ta X/Y reference (s)": res.rsa_x.Ta_s,
+                "CuTa (s)": inp.asce7.Cu * res.rsa_x.Ta_s,
+                "T_used ELF X (s)": res.rsa_x.T_used_s,
+                "T_used ELF Y (s)": res.rsa_y.T_used_s,
                 "Mass X (%)": 100 * mass_x,
                 "Mass Y (%)": 100 * mass_y,
                 "Max drift X": max_drift_x,
                 "Max drift Y": max_drift_y,
                 "Drift limit": inp.drift_limit_ratio,
-                "Base shear X (kN)": res.rsa_x.base_shear_scaled_kN,
-                "Base shear Y (kN)": res.rsa_y.base_shear_scaled_kN,
+                "RSA scale X": res.rsa_x.rsa_scale_factor,
+                "RSA scale Y": res.rsa_y.rsa_scale_factor,
+                "ELF base shear X (kN)": res.rsa_x.elf_base_shear_kN,
+                "ELF base shear Y (kN)": res.rsa_y.elf_base_shear_kN,
+                "Scaled RSA base shear X (kN)": res.rsa_x.base_shear_scaled_kN,
+                "Scaled RSA base shear Y (kN)": res.rsa_y.base_shear_scaled_kN,
                 "Concrete (m³)": total_concrete,
                 "Steel (kg)": total_steel,
                 "Core wall base t (m)": res.sections[0].core_wall_t,
@@ -1060,28 +1088,39 @@ def run_design(inp: BuildingInput) -> DesignResult:
         ok_drift = max_drift <= inp.drift_limit_ratio * 1.03
         ok_mass = min_mass >= inp.minimum_modal_mass_ratio
 
-        if ok_drift and ok_mass:
+        if ok_drift and ok_mass and drift_ratio_over >= 0.35:
             best = res
             break
 
+        # Redesign logic: drift controls stiffness.
         if max_drift > inp.drift_limit_ratio:
-            growth = min(inp.growth_limit_per_iteration, drift_over ** 0.18)
-            wall_scale *= growth
-            col_scale *= min(inp.growth_limit_per_iteration, drift_over ** 0.10)
-        else:
-            # If too stiff, reduce slightly to avoid overdesign
-            if max_drift < 0.30 * inp.drift_limit_ratio:
-                wall_scale *= inp.reduction_limit_per_iteration
-                col_scale *= inp.reduction_limit_per_iteration
+            # Too flexible: increase main stiffness.
+            growth_wall = min(inp.growth_limit_per_iteration, drift_ratio_over ** 0.20)
+            growth_col = min(inp.growth_limit_per_iteration, drift_ratio_over ** 0.12)
+            wall_scale *= growth_wall
+            col_scale *= growth_col
 
-        wall_scale = float(np.clip(wall_scale, 0.50, 3.00))
-        col_scale = float(np.clip(col_scale, 0.50, 3.00))
+        elif drift_ratio_over < 0.35:
+            # Too stiff/uneconomical: reduce cautiously.
+            wall_scale *= inp.reduction_limit_per_iteration
+            col_scale *= inp.reduction_limit_per_iteration
+
+        # Slab/beam scale is not used to force the seismic period. It may change
+        # only mildly because slab/beam dimensions mainly control gravity/framing economy.
+        slab_scale = 1.0
+
+        wall_scale = float(np.clip(wall_scale, 0.40, 3.50))
+        col_scale = float(np.clip(col_scale, 0.40, 3.50))
 
     if best is None:
         best = evaluate(inp, wall_scale, col_scale, slab_scale)
 
     best.iteration_table = pd.DataFrame(logs)
-    best.final_message = f"Completed with {len(logs)} iteration(s)."
+    best.final_message = (
+        "ASCE-compliant modal RSA predesign completed. "
+        "The solver did not target a period; it computed modal periods and resized members based on drift, "
+        "modal mass participation, and ASCE ELF/RSA base-shear consistency."
+    )
     return best
 
 
@@ -1402,6 +1441,13 @@ def build_report(res: DesignResult) -> str:
     lines.append("The solver is a flexural MDOF cantilever model with two DOFs at each floor node:")
     lines.append("lateral displacement u and rotation theta. The eigenvalue problem is [K]phi = omega^2[M]phi.")
     lines.append("Outriggers are modeled as rotational restraints at the actual outrigger stories.")
+    lines.append("The model does not force a target period. Period is computed from mass and stiffness.")
+    lines.append("ELF base shear uses the ASCE period cap T_used = min(T_modal, Cu*Ta) when activated.")
+    lines.append("RSA base shear is scaled to the required ELF minimum; drift controls redesign.")
+    lines.append("")
+    lines.append("1B. Design principles")
+    lines.append("-" * 96)
+    lines.append(design_principles_table(res).to_string(index=False))
     lines.append("")
     lines.append("2. Global response")
     lines.append("-" * 96)
@@ -1518,6 +1564,43 @@ def design_check_table(res: DesignResult) -> pd.DataFrame:
         {"Check": "Y modal mass participation", "Demand": mass_y, "Limit": res.input.minimum_modal_mass_ratio, "Status": "OK" if mass_y >= res.input.minimum_modal_mass_ratio else "NOT OK"},
         {"Check": "X RSA base shear scaling", "Demand": res.rsa_x.base_shear_unscaled_kN, "Limit": res.input.asce7.rsa_min_ratio_to_elf * res.rsa_x.elf_base_shear_kN, "Status": "SCALED" if res.rsa_x.rsa_scale_factor > 1.0001 else "OK"},
         {"Check": "Y RSA base shear scaling", "Demand": res.rsa_y.base_shear_unscaled_kN, "Limit": res.input.asce7.rsa_min_ratio_to_elf * res.rsa_y.elf_base_shear_kN, "Status": "SCALED" if res.rsa_y.rsa_scale_factor > 1.0001 else "OK"},
+    ])
+
+
+
+def design_principles_table(res: DesignResult) -> pd.DataFrame:
+    inp = res.input
+    return pd.DataFrame([
+        {
+            "Principle": "Modal period",
+            "Implemented rule": "Computed from flexural MDOF eigenvalue analysis.",
+            "Engineering meaning": "Period is an output of stiffness and mass, not a target to be forced."
+        },
+        {
+            "Principle": "ASCE 7 period control",
+            "Implemented rule": "ELF base shear uses T_used = min(T_modal, Cu*Ta) when CuTa cap is activated.",
+            "Engineering meaning": "Very long analytical periods are not allowed to reduce base shear without limit."
+        },
+        {
+            "Principle": "RSA base shear scaling",
+            "Implemented rule": f"RSA base shear is scaled to at least {inp.asce7.rsa_min_ratio_to_elf:.2f} times ELF base shear.",
+            "Engineering meaning": "Modal RSA force demand is kept consistent with ASCE minimum lateral strength."
+        },
+        {
+            "Principle": "Drift-controlled redesign",
+            "Implemented rule": "Wall, column, and outrigger stiffness increase only when design drift exceeds the limit.",
+            "Engineering meaning": "The structure is resized for serviceability/stability, not for arbitrary period matching."
+        },
+        {
+            "Principle": "Modal mass participation",
+            "Implemented rule": f"Selected modes must reach at least {100*inp.minimum_modal_mass_ratio:.1f}% cumulative effective modal mass.",
+            "Engineering meaning": "Enough modes must be included for a valid modal response estimate."
+        },
+        {
+            "Principle": "Outrigger modeling",
+            "Implemented rule": "Tubular or truss outrigger is converted to rotational restraint Ktheta at real outrigger stories.",
+            "Engineering meaning": "Outrigger resists core rotation through axial action, not by fake lateral springs."
+        },
     ])
 
 
@@ -1774,11 +1857,11 @@ def main():
         unsafe_allow_html=True,
     )
 
-    st.title("Professional Tall Building Preliminary Design + Correct Flexural MDOF Solver")
+    st.title("ASCE 7 Compliant Modal RSA Tower Predesign + Drift-Controlled Solver")
     st.caption(APP_VERSION)
     st.info(
         "This version keeps a rich interface but uses a flexural MDOF solver with displacement and rotation DOFs. "
-        "Outriggers are rotational restraints at real levels, not fake lateral springs."
+        "Periods are computed, not targeted. Redesign is controlled by ASCE ELF/RSA consistency, modal mass, and drift."
     )
 
     if "v13_result" not in st.session_state:
@@ -1835,6 +1918,7 @@ def main():
 
         tabs = st.tabs(
             [
+                "PRINCIPLES",
                 "FINAL DESIGN",
                 "OUTRIGGER DESIGN",
                 "DESIGN CHECKS",
@@ -1854,38 +1938,42 @@ def main():
         )
 
         with tabs[0]:
+            st.markdown("### Design principles used in this solver")
+            st.dataframe(design_principles_table(res), use_container_width=True, hide_index=True)
+
+        with tabs[1]:
             st.markdown("### Final preliminary design dimensions")
             st.dataframe(final_design_dashboard_table(res), use_container_width=True, hide_index=True)
             st.markdown("### Main design quantities")
             st.dataframe(summary_table(res), use_container_width=True, hide_index=True)
 
-        with tabs[1]:
+        with tabs[2]:
             st.markdown("### Outrigger design result")
             st.dataframe(outrigger_design_table(res), use_container_width=True, hide_index=True)
             st.caption("Ktheta is the rotational restraint added to the flexural MDOF solver at the real outrigger levels.")
 
-        with tabs[2]:
+        with tabs[3]:
             st.markdown("### Design checks")
             st.dataframe(design_check_table(res), use_container_width=True, hide_index=True)
 
-        with tabs[3]:
+        with tabs[4]:
             st.dataframe(summary_table(res), use_container_width=True, hide_index=True)
 
-        with tabs[4]:
+        with tabs[5]:
             st.dataframe(final_dimensions_table(res), use_container_width=True, hide_index=True)
 
-        with tabs[5]:
+        with tabs[6]:
             st.pyplot(plot_plan(res, zone_name), use_container_width=True)
 
-        with tabs[6]:
+        with tabs[7]:
             st.pyplot(plot_modes(res, Direction.X), use_container_width=True)
             st.dataframe(modal_table(res.modal_x), use_container_width=True, hide_index=True)
 
-        with tabs[7]:
+        with tabs[8]:
             st.pyplot(plot_modes(res, Direction.Y), use_container_width=True)
             st.dataframe(modal_table(res.modal_y), use_container_width=True, hide_index=True)
 
-        with tabs[8]:
+        with tabs[9]:
             p1, p2 = st.columns(2)
             with p1:
                 st.pyplot(plot_story_response(res, Direction.X, "Story shear"), use_container_width=True)
@@ -1893,7 +1981,7 @@ def main():
                 st.pyplot(plot_story_response(res, Direction.X, "Drift ratio"), use_container_width=True)
             st.dataframe(story_response_table(res, Direction.X), use_container_width=True, hide_index=True)
 
-        with tabs[9]:
+        with tabs[10]:
             p1, p2 = st.columns(2)
             with p1:
                 st.pyplot(plot_story_response(res, Direction.Y, "Story shear"), use_container_width=True)
@@ -1901,27 +1989,27 @@ def main():
                 st.pyplot(plot_story_response(res, Direction.Y, "Drift ratio"), use_container_width=True)
             st.dataframe(story_response_table(res, Direction.Y), use_container_width=True, hide_index=True)
 
-        with tabs[10]:
+        with tabs[11]:
             st.pyplot(plot_stiffness(res), use_container_width=True)
             st.dataframe(stiffness_table(res), use_container_width=True, hide_index=True)
 
-        with tabs[11]:
+        with tabs[12]:
             st.pyplot(plot_spectrum(res.input), use_container_width=True)
             st.dataframe(spectrum_table(res.input), use_container_width=True, hide_index=True)
 
-        with tabs[12]:
+        with tabs[13]:
             fig = plot_iteration(res)
             if fig is not None:
                 st.pyplot(fig, use_container_width=True)
             st.dataframe(res.iteration_table, use_container_width=True, hide_index=True)
 
-        with tabs[13]:
+        with tabs[14]:
             st.markdown("### Story sections")
             st.dataframe(pd.DataFrame([s.__dict__ for s in res.sections]), use_container_width=True, hide_index=True)
             st.markdown("### Story properties")
             st.dataframe(pd.DataFrame([p.__dict__ for p in res.properties]), use_container_width=True, hide_index=True)
 
-        with tabs[14]:
+        with tabs[15]:
             st.text_area("Report", st.session_state.v13_report, height=600)
 
 
