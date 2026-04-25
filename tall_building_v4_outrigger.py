@@ -1,35 +1,21 @@
-
 """
-tower_predesign_v13_professional_solver.py
+Tall Building Outrigger Predesign Framework - Version 4
+=======================================================
 
-Professional Tall Building Preliminary Design + Correct MDOF Solver
-===================================================================
+A preliminary structural engineering tool for comparing tall-building lateral
+systems with and without outrigger/braced-bay action.
 
-Purpose
--------
-This version keeps the rich input/output philosophy of the uploaded Streamlit code,
-but replaces the weak shear-spring solver with a correct flexural MDOF solver.
+Core features
+-------------
+- Flexural MDOF stick model with lateral displacement and rotation at each floor.
+- Modal eigenvalue solution for X and Y directions.
+- ASCE 7 response-spectrum and ELF scaling options.
+- Drift-controlled preliminary redesign loop.
+- Real braced-bay outrigger layout: selected bay panels are used consistently
+  in the plan drawing, stiffness calculation, and global stiffness matrix.
 
-Core solver:
-    - Euler-Bernoulli vertical cantilever model
-    - 2 DOFs per floor node: lateral displacement u and rotation theta
-    - independent X and Y directional analysis
-    - modal eigenvalue solution: [K]{phi} = omega^2[M]{phi}
-    - modal participation and cumulative effective mass
-    - ASCE 7 response spectrum option
-    - CQC/SRSS modal combination
-    - ELF base-shear scaling
-    - drift amplification by Cd/Ie
-    - outrigger modeled as rotational restraint at actual outrigger stories
-
-Important
----------
-This is a preliminary design framework. It is not a full replacement for ETABS.
-It is intended to produce defensible preliminary dimensions, modal periods,
-drifts, story forces, and comparative outrigger behavior.
-
-Author: Benyamin
-Version: v13.0-professional-flexural-MDOF
+Author: Benyamin Rezazian
+Version: 4.0
 """
 
 from __future__ import annotations
@@ -48,7 +34,9 @@ except Exception:
     scipy_eigh = None
 
 
-APP_VERSION = "v26.0-direct-span-brace-sum-outrigger-stiffness"
+APP_VERSION = "4.0"
+PROJECT_TITLE = "Tall Building Outrigger Predesign Framework"
+AUTHOR_NAME = "Benyamin Rezazian"
 G = 9.81
 RHO_STEEL = 7850.0
 STEEL_E_MPA = 200000.0  # steel modulus for tubular/truss outrigger members
@@ -1467,6 +1455,9 @@ def summary_table(res: DesignResult) -> pd.DataFrame:
     return pd.DataFrame(
         {
             "Item": [
+                "Project title",
+                "Author",
+                "Version",
                 "Height",
                 "Floor area",
                 "Total seismic weight",
@@ -1484,6 +1475,9 @@ def summary_table(res: DesignResult) -> pd.DataFrame:
                 "Outrigger system",
             ],
             "Value": [
+                PROJECT_TITLE,
+                AUTHOR_NAME,
+                APP_VERSION,
                 res.input.height,
                 res.input.floor_area,
                 total_weight,
@@ -1501,7 +1495,7 @@ def summary_table(res: DesignResult) -> pd.DataFrame:
                 res.input.outrigger_system.value,
             ],
             "Unit": [
-                "m", "m²", "kN", "kg", "s", "s", "%", "%", "kN", "kN",
+                "-", "-", "-", "m", "m²", "kN", "kg", "s", "s", "%", "%", "kN", "kN",
                 "-", "-", "m³", "kg", "-",
             ],
         }
@@ -1599,18 +1593,23 @@ def stiffness_table(res: DesignResult) -> pd.DataFrame:
 # ============================================================
 
 def plot_plan(res: DesignResult, zone_choice: str):
+    """Draw the structural plan with real braced bay panels.
+
+    The same bay IDs used in stiffness calculations are drawn here. Bracing is
+    placed inside actual column-to-column panels, not distributed by arbitrary
+    interpolation.
+    """
     sec = next((s for s in res.sections if s.zone == zone_choice), res.sections[0])
     inp = res.input
-    fig, ax = plt.subplots(figsize=(13, 9))
+    fig, ax = plt.subplots(figsize=(13, 10))
 
-    ax.plot([0, inp.plan_x, inp.plan_x, 0, 0], [0, 0, inp.plan_y, inp.plan_y, 0], color="black", linewidth=1.5)
-
+    ax.plot([0, inp.plan_x, inp.plan_x, 0, 0], [0, 0, inp.plan_y, inp.plan_y, 0], color="black", linewidth=1.8)
     for i in range(inp.n_bays_x + 1):
         x = i * inp.bay_x
-        ax.plot([x, x], [0, inp.plan_y], color="#dddddd", linewidth=0.8)
+        ax.plot([x, x], [0, inp.plan_y], color="0.45", linewidth=0.8)
     for j in range(inp.n_bays_y + 1):
         y = j * inp.bay_y
-        ax.plot([0, inp.plan_x], [y, y], color="#dddddd", linewidth=0.8)
+        ax.plot([0, inp.plan_x], [y, y], color="0.45", linewidth=0.8)
 
     for i in range(inp.n_bays_x + 1):
         for j in range(inp.n_bays_y + 1):
@@ -1619,83 +1618,68 @@ def plot_plan(res: DesignResult, zone_choice: str):
             at_x = i == 0 or i == inp.n_bays_x
             at_y = j == 0 or j == inp.n_bays_y
             if at_x and at_y:
-                bx, by, col = sec.column_corner_x, sec.column_corner_y, "#8b0000"
+                bx, by = sec.column_corner_x, sec.column_corner_y
             elif at_x or at_y:
-                bx, by, col = sec.column_perimeter_x, sec.column_perimeter_y, "#cc5500"
+                bx, by = sec.column_perimeter_x, sec.column_perimeter_y
             else:
-                bx, by, col = sec.column_interior_x, sec.column_interior_y, "#4444aa"
-            ax.add_patch(plt.Rectangle((x - bx / 2, y - by / 2), bx, by, facecolor=col, edgecolor="black", linewidth=0.4, alpha=0.9))
+                bx, by = sec.column_interior_x, sec.column_interior_y
+            ax.add_patch(plt.Rectangle((x - bx / 2, y - by / 2), bx, by, facecolor="white", edgecolor="black", linewidth=0.9))
 
     cx0 = (inp.plan_x - sec.core_x) / 2
     cy0 = (inp.plan_y - sec.core_y) / 2
     cx1 = cx0 + sec.core_x
     cy1 = cy0 + sec.core_y
-    mx, my = inp.plan_x / 2, inp.plan_y / 2
-
-    # Core wall box
-    ax.add_patch(plt.Rectangle((cx0, cy0), sec.core_x, sec.core_y, fill=False, edgecolor="#2e8b57", linewidth=2.8))
-    ax.add_patch(plt.Rectangle((cx0, cy0), sec.core_x, sec.core_wall_t, facecolor="#2e8b57", alpha=0.25))
-    ax.add_patch(plt.Rectangle((cx0, cy1 - sec.core_wall_t), sec.core_x, sec.core_wall_t, facecolor="#2e8b57", alpha=0.25))
-    ax.add_patch(plt.Rectangle((cx0, cy0), sec.core_wall_t, sec.core_y, facecolor="#2e8b57", alpha=0.25))
-    ax.add_patch(plt.Rectangle((cx1 - sec.core_wall_t, cy0), sec.core_wall_t, sec.core_y, facecolor="#2e8b57", alpha=0.25))
-
-    # Side walls
-    ax.plot([mx - sec.side_wall_length_x/2, mx + sec.side_wall_length_x/2], [0, 0], color="#4caf50", linewidth=5)
-    ax.plot([mx - sec.side_wall_length_x/2, mx + sec.side_wall_length_x/2], [inp.plan_y, inp.plan_y], color="#4caf50", linewidth=5)
-    ax.plot([0, 0], [my - sec.side_wall_length_y/2, my + sec.side_wall_length_y/2], color="#4caf50", linewidth=5)
-    ax.plot([inp.plan_x, inp.plan_x], [my - sec.side_wall_length_y/2, my + sec.side_wall_length_y/2], color="#4caf50", linewidth=5)
+    ax.add_patch(plt.Rectangle((cx0, cy0), sec.core_x, sec.core_y, fill=False, edgecolor="black", linewidth=7.0))
 
     zone_stories = [s.story for s in res.sections if s.zone == sec.zone]
     outriggers_in_zone = [lev for lev in active_outrigger_levels(inp) if lev in zone_stories]
 
+    def draw_x_panel(x0, x1, y0, y1, lw=1.2):
+        ax.plot([x0, x1], [y0, y1], color="black", linewidth=lw)
+        ax.plot([x0, x1], [y1, y0], color="black", linewidth=lw)
+
     if inp.outrigger_system != OutriggerSystem.NONE and outriggers_in_zone:
-        # perimeter belt / collector
-        ax.plot([0, inp.plan_x, inp.plan_x, 0, 0], [0, 0, inp.plan_y, inp.plan_y, 0],
-                color="#ff6b00", linewidth=3.0, alpha=0.75)
+        y_bays_for_x = active_braced_bays(inp, Direction.X)
+        x_bays_for_y = active_braced_bays(inp, Direction.Y)
 
-        # Real braced bay layout: braces are drawn inside actual grid bays, not randomly spread.
-        y_bays_for_x_resistance = active_braced_bays(inp, Direction.X)  # E/W strips, selected bay IDs along Y
-        x_bays_for_y_resistance = active_braced_bays(inp, Direction.Y)  # N/S strips, selected bay IDs along X
+        belt_lw = 5.0
+        for y in [cy0, cy1]:
+            ax.plot([0, cx0], [y, y], color="black", linewidth=belt_lw, solid_capstyle="butt")
+            ax.plot([cx1, inp.plan_x], [y, y], color="black", linewidth=belt_lw, solid_capstyle="butt")
+        for x in [cx0, cx1]:
+            ax.plot([x, x], [0, cy0], color="black", linewidth=belt_lw, solid_capstyle="butt")
+            ax.plot([x, x], [cy1, inp.plan_y], color="black", linewidth=belt_lw, solid_capstyle="butt")
 
-        for j in y_bays_for_x_resistance:
+        for j in y_bays_for_x:
             y0 = j * inp.bay_y
             y1 = (j + 1) * inp.bay_y
-            yc = 0.5 * (y0 + y1)
-            ax.plot([0, cx0], [yc, yc], color="#ff6b00", linewidth=4.0)
-            ax.plot([cx1, inp.plan_x], [yc, yc], color="#ff6b00", linewidth=4.0)
-            ax.plot([0, inp.bay_x], [y0, y1], color="#b34700", linewidth=2.6)
-            ax.plot([0, inp.bay_x], [y1, y0], color="#b34700", linewidth=2.6)
-            ax.plot([inp.plan_x - inp.bay_x, inp.plan_x], [y0, y1], color="#b34700", linewidth=2.6)
-            ax.plot([inp.plan_x - inp.bay_x, inp.plan_x], [y1, y0], color="#b34700", linewidth=2.6)
+            draw_x_panel(0, inp.bay_x, y0, y1)
+            draw_x_panel(inp.plan_x - inp.bay_x, inp.plan_x, y0, y1)
 
-        for i in x_bays_for_y_resistance:
+        for i in x_bays_for_y:
             x0 = i * inp.bay_x
             x1 = (i + 1) * inp.bay_x
-            xc = 0.5 * (x0 + x1)
-            ax.plot([xc, xc], [0, cy0], color="#ff6b00", linewidth=4.0)
-            ax.plot([xc, xc], [cy1, inp.plan_y], color="#ff6b00", linewidth=4.0)
-            ax.plot([x0, x1], [0, inp.bay_y], color="#b34700", linewidth=2.6)
-            ax.plot([x1, x0], [0, inp.bay_y], color="#b34700", linewidth=2.6)
-            ax.plot([x0, x1], [inp.plan_y - inp.bay_y, inp.plan_y], color="#b34700", linewidth=2.6)
-            ax.plot([x1, x0], [inp.plan_y - inp.bay_y, inp.plan_y], color="#b34700", linewidth=2.6)
+            draw_x_panel(x0, x1, 0, inp.bay_y)
+            draw_x_panel(x0, x1, inp.plan_y - inp.bay_y, inp.plan_y)
 
+        ax.plot([0, inp.plan_x, inp.plan_x, 0, 0], [0, 0, inp.plan_y, inp.plan_y, 0], color="black", linewidth=2.4)
         ax.text(inp.plan_x + 2, inp.plan_y * 0.50,
-                f"OUTRIGGER LOAD PATH\nActive stories: {outriggers_in_zone}\n{inp.outrigger_system.value}\nX braced bay IDs: {list(y_bays_for_x_resistance)}\nY braced bay IDs: {list(x_bays_for_y_resistance)}",
-                fontsize=9, color="#b34700", fontweight="bold", va="center")
-    else:
-        ax.text(inp.plan_x + 2, inp.plan_y * 0.50,
-                f"No outrigger in this displayed zone\nOutrigger stories: {list(active_outrigger_levels(inp))}",
-                fontsize=9, color="#666666", va="center")
+                f"OUTRIGGER\nStories: {outriggers_in_zone}\nX bay IDs: {list(y_bays_for_x)}\nY bay IDs: {list(x_bays_for_y)}",
+                fontsize=9, va="center")
 
-    ax.set_title(f"Plan view - {zone_choice} | Core + perimeter belt + tubular outrigger load path")
+    ax.annotate(f"Total Length = {inp.plan_x:.1f} m", xy=(0, -2.5), xytext=(inp.plan_x, -2.5),
+                arrowprops=dict(arrowstyle="<->", lw=1.0), ha="center", va="center", fontsize=9)
+    ax.annotate(f"Total Length = {inp.plan_y:.1f} m", xy=(-2.5, 0), xytext=(-2.5, inp.plan_y),
+                arrowprops=dict(arrowstyle="<->", lw=1.0), ha="center", va="center", rotation=90, fontsize=9)
+    ax.text(2.0, 2.0, f"STRUCTURAL LAYOUT\n{PROJECT_TITLE}\nVERSION: {APP_VERSION}\nAUTHOR: {AUTHOR_NAME}",
+            fontsize=10, va="top", bbox=dict(facecolor="white", edgecolor="black", linewidth=0.8))
+
+    ax.set_title(f"Structural plan - {zone_choice}")
     ax.set_aspect("equal")
-    ax.set_xlim(-5, inp.plan_x + 35)
+    ax.set_xlim(-5, inp.plan_x + 26)
     ax.set_ylim(inp.plan_y + 5, -5)
-    ax.text(inp.plan_x + 2, 3,
-            f"Core: {sec.core_x:.2f} x {sec.core_y:.2f} m\nWall t: {sec.core_wall_t:.2f} m\nBeam: {sec.beam_b:.2f} x {sec.beam_h:.2f} m\nSlab: {sec.slab_t:.2f} m",
-            va="top", fontsize=9)
+    ax.axis("off")
     return fig
-
 def plot_modes(res: DesignResult, direction: Direction):
     modal = res.modal_x if direction == Direction.X else res.modal_y
     y = np.array([s.elevation_m for s in res.sections])
@@ -1826,15 +1810,16 @@ def plot_spectrum(inp: BuildingInput):
 def build_report(res: DesignResult) -> str:
     lines = []
     lines.append("=" * 96)
-    lines.append("PROFESSIONAL TALL BUILDING PRELIMINARY DESIGN REPORT")
+    lines.append(f"{PROJECT_TITLE.upper()} - PRELIMINARY DESIGN REPORT")
     lines.append("=" * 96)
     lines.append(f"Version: {APP_VERSION}")
+    lines.append(f"Author: {AUTHOR_NAME}")
     lines.append("")
     lines.append("1. Solver definition")
     lines.append("-" * 96)
     lines.append("The solver is a flexural MDOF cantilever model with two DOFs at each floor node:")
     lines.append("lateral displacement u and rotation theta. The eigenvalue problem is [K]phi = omega^2[M]phi.")
-    lines.append("Outriggers are modeled as rotational restraints at the actual outrigger stories.")
+    lines.append("Outriggers are modeled from real braced bay panels; each diagonal contributes EA/L*cos^2(theta), and the summed stiffness is condensed into the floor DOFs.")
     lines.append("The model does not force a target period. Period is computed from mass and stiffness.")
     lines.append("ELF base shear uses the ASCE period cap T_used = min(T_modal, Cu*Ta) when activated.")
     lines.append("RSA base shear is scaled to the required ELF minimum; drift controls redesign.")
@@ -1971,8 +1956,8 @@ def design_principles_table(res: DesignResult) -> pd.DataFrame:
         },
         {
             "Principle": "Outrigger modeling",
-            "Implemented rule": "Tubular or truss outrigger is converted to rotational restraint Ktheta at real outrigger stories using steel modulus Es=200000 MPa.",
-            "Engineering meaning": "Outrigger resists core rotation through axial action, not by fake lateral springs."
+            "Implemented rule": "Tubular/truss braced bay panels are summed as K_out = sum(EA/L*cos²θ), then condensed to [u, theta] floor DOFs with lever-arm coupling.",
+            "Engineering meaning": "Outrigger stiffness enters the global stiffness matrix through the same braced bays shown in the plan."
         },
     ])
 
@@ -2318,7 +2303,7 @@ def main():
     import streamlit as st
 
     st.set_page_config(
-        page_title="Professional Tower Predesign v13",
+        page_title=PROJECT_TITLE,
         layout="wide",
         initial_sidebar_state="expanded",
     )
@@ -2334,17 +2319,14 @@ def main():
         unsafe_allow_html=True,
     )
 
-    st.title("ASCE 7 Compliant Modal RSA Tower Predesign + Drift-Controlled Solver")
-    st.caption(APP_VERSION)
-    st.info(
-        "This version keeps a rich interface but uses a flexural MDOF solver with displacement and rotation DOFs. "
-        "Periods are computed, not targeted. Outrigger load path is shown in plan and included as steel rotational restraint."
-    )
+    st.title(PROJECT_TITLE)
+    st.caption(f"Version {APP_VERSION} | Author: {AUTHOR_NAME}")
+    st.info("Engineering preliminary design framework: MDOF modal response, braced-bay outrigger stiffness, drift checks, and with/without outrigger comparison.")
 
-    if "v13_result" not in st.session_state:
-        st.session_state.v13_result = None
-    if "v13_report" not in st.session_state:
-        st.session_state.v13_report = ""
+    if "v4_result" not in st.session_state:
+        st.session_state.v4_result = None
+    if "v4_report" not in st.session_state:
+        st.session_state.v4_report = ""
 
     left, right = st.columns([1.05, 2.35], gap="medium")
 
@@ -2356,26 +2338,26 @@ def main():
                 try:
                     with st.spinner("Running professional flexural MDOF solver..."):
                         res = run_design(inp)
-                        st.session_state.v13_result = res
-                        st.session_state.v13_report = build_report(res)
+                        st.session_state.v4_result = res
+                        st.session_state.v4_report = build_report(res)
                     st.success("Analysis completed.")
                 except Exception as e:
                     st.error(f"Analysis failed: {e}")
         with b2:
-            if st.session_state.v13_report:
+            if st.session_state.v4_report:
                 st.download_button(
                     "SAVE REPORT",
-                    data=st.session_state.v13_report.encode("utf-8"),
-                    file_name="tower_predesign_v13_report.txt",
+                    data=st.session_state.v4_report.encode("utf-8"),
+                    file_name="tower_predesign_v4_report.txt",
                     mime="text/plain",
                 )
             else:
                 st.button("SAVE REPORT", disabled=True)
 
     with right:
-        res = st.session_state.v13_result
+        res = st.session_state.v4_result
         if res is None:
-            st.info("Click ANALYZE to run the professional MDOF predesign.")
+            st.info("Click ANALYZE to run the Version 4 MDOF predesign.")
             return
 
         s = summary_table(res)
@@ -2495,7 +2477,7 @@ def main():
             st.dataframe(pd.DataFrame([p.__dict__ for p in res.properties]), use_container_width=True, hide_index=True)
 
         with tabs[16]:
-            st.text_area("Report", st.session_state.v13_report, height=600)
+            st.text_area("Report", st.session_state.v4_report, height=600)
 
 
 if __name__ == "__main__":
