@@ -48,7 +48,7 @@ except Exception:
     scipy_eigh = None
 
 
-APP_VERSION = "v23.0-same-model-corrected-frame-stiffness-and-outrigger"
+APP_VERSION = "v24.0-outrigger-count-and-real-braced-bay-layout"
 G = 9.81
 RHO_STEEL = 7850.0
 STEEL_E_MPA = 200000.0  # steel modulus for tubular/truss outrigger members
@@ -401,7 +401,7 @@ def slab_thickness(inp: BuildingInput, story: int, scale: float = 1.0) -> float:
     span = max(inp.bay_x, inp.bay_y)
     h_ratio = 1.0 - (story - 1) / max(inp.n_story - 1, 1)
     zone_factor = 1.00 + 0.08 * h_ratio
-    out_factor = 1.10 if story in inp.outrigger_story_levels and inp.outrigger_system != OutriggerSystem.NONE else 1.00
+    out_factor = 1.10 if story in active_outrigger_levels(inp) and inp.outrigger_system != OutriggerSystem.NONE else 1.00
     t = span / 32.0 * zone_factor * out_factor * scale * inp.design_slab_scale
     return float(np.clip(t, inp.min_slab_thickness, inp.max_slab_thickness))
 
@@ -418,7 +418,7 @@ def beam_size(inp: BuildingInput, story: int, scale: float = 1.0) -> Tuple[float
     zone_factor = 0.82 + 0.28 * h_ratio
 
     # collector beams at outrigger floors must be stronger
-    out_factor = 1.35 if story in inp.outrigger_story_levels and inp.outrigger_system != OutriggerSystem.NONE else 1.00
+    out_factor = 1.35 if story in active_outrigger_levels(inp) and inp.outrigger_system != OutriggerSystem.NONE else 1.00
 
     h = base_h * zone_factor * out_factor * scale * inp.design_beam_scale
     h = float(np.clip(h, inp.min_beam_depth, 2.80))
@@ -653,6 +653,52 @@ def outrigger_efficiency(system: OutriggerSystem) -> float:
 
 
 
+
+def centered_bay_indices(n_bays: int, requested_count: int) -> Tuple[int, ...]:
+    """
+    Return actual grid bay indices centered about the building centerline.
+
+    Bay index i means the bay between column grid lines i and i+1.
+    This prevents the previous mistake where plan braces were spread by linspace
+    and did not correspond to real bays between columns.
+    """
+    n_bays = int(max(n_bays, 1))
+    requested_count = int(max(min(requested_count, n_bays), 0))
+    if requested_count <= 0:
+        return tuple()
+    start = max((n_bays - requested_count) // 2, 0)
+    return tuple(range(start, start + requested_count))
+
+
+def active_braced_bays(inp: BuildingInput, direction: Direction) -> Tuple[int, ...]:
+    """
+    Actual braced bay indices used both in stiffness and drawing.
+
+    Direction.X means lateral X response; braces are placed on the west/east
+    perimeter strips and selected by bay IDs along Y.
+    Direction.Y means lateral Y response; braces are placed on the south/north
+    perimeter strips and selected by bay IDs along X.
+    """
+    if direction == Direction.X:
+        return centered_bay_indices(inp.n_bays_y, inp.braced_spans_x)
+    return centered_bay_indices(inp.n_bays_x, inp.braced_spans_y)
+
+
+def active_outrigger_levels(inp: BuildingInput) -> Tuple[int, ...]:
+    """
+    Enforce user-specified outrigger_count.
+    Only the first valid, unique levels are active.
+    """
+    if inp.outrigger_system == OutriggerSystem.NONE or inp.outrigger_count <= 0:
+        return tuple()
+    levels = []
+    for lev in inp.outrigger_story_levels:
+        ilev = int(lev)
+        if 1 <= ilev <= inp.n_story and ilev not in levels:
+            levels.append(ilev)
+    return tuple(levels[: int(inp.outrigger_count)])
+
+
 def outrigger_Ktheta(inp: BuildingInput, sec: StorySection, direction: Direction) -> float:
     """
     Real preliminary outrigger stiffness model.
@@ -672,7 +718,7 @@ def outrigger_Ktheta(inp: BuildingInput, sec: StorySection, direction: Direction
     """
     if inp.outrigger_system == OutriggerSystem.NONE:
         return 0.0
-    if sec.story not in inp.outrigger_story_levels:
+    if sec.story not in active_outrigger_levels(inp):
         return 0.0
 
     E_steel = STEEL_E_MPA * 1e6
@@ -684,7 +730,8 @@ def outrigger_Ktheta(inp: BuildingInput, sec: StorySection, direction: Direction
         bay = max(inp.bay_x, 1e-9)
         core_dim = sec.core_x
         plan_dim = inp.plan_x
-        n_bays = int(max(min(inp.braced_spans_x, inp.n_bays_x), 1))
+        bay_ids = active_braced_bays(inp, Direction.X)
+        n_bays = len(bay_ids)
         n_lines = 2  # left and right sides of the core
         exterior_col_area = sec.column_perimeter_x * sec.column_perimeter_y
         corner_col_area = sec.column_corner_x * sec.column_corner_y
@@ -693,10 +740,14 @@ def outrigger_Ktheta(inp: BuildingInput, sec: StorySection, direction: Direction
         bay = max(inp.bay_y, 1e-9)
         core_dim = sec.core_y
         plan_dim = inp.plan_y
-        n_bays = int(max(min(inp.braced_spans_y, inp.n_bays_y), 1))
+        bay_ids = active_braced_bays(inp, Direction.Y)
+        n_bays = len(bay_ids)
         n_lines = 2
         exterior_col_area = sec.column_perimeter_x * sec.column_perimeter_y
         corner_col_area = sec.column_corner_x * sec.column_corner_y
+
+    if n_bays <= 0:
+        return 0.0
 
     lever_arm = max((plan_dim - core_dim) / 2.0, bay)  # core face to exterior line, not full building width
     story_h = max(inp.story_height, 1e-9)
@@ -754,7 +805,7 @@ def outrigger_Klateral(inp: BuildingInput, sec: StorySection, direction: Directi
     """
     if inp.outrigger_system == OutriggerSystem.NONE:
         return 0.0
-    if sec.story not in inp.outrigger_story_levels:
+    if sec.story not in active_outrigger_levels(inp):
         return 0.0
 
     h_level = max(sec.elevation_m, inp.story_height)
@@ -762,7 +813,7 @@ def outrigger_Klateral(inp: BuildingInput, sec: StorySection, direction: Directi
     if ktheta <= 0.0:
         return 0.0
 
-    n_spans = max(inp.braced_spans_x if direction == Direction.X else inp.braced_spans_y, 1)
+    n_spans = max(len(active_braced_bays(inp, direction)), 1)
     participation = min(0.30 + 0.07 * n_spans, 0.65)
     return float(participation * ktheta / (h_level ** 2))
 
@@ -792,20 +843,20 @@ def story_mass_and_quantities(inp: BuildingInput, sec: StorySection) -> Tuple[fl
         + col_vol * inp.column_rebar_ratio
     ) * RHO_STEEL
 
-    if sec.story in inp.outrigger_story_levels and inp.outrigger_system != OutriggerSystem.NONE:
+    if sec.story in active_outrigger_levels(inp) and inp.outrigger_system != OutriggerSystem.NONE:
         if inp.outrigger_system == OutriggerSystem.TUBULAR_BRACE:
             A_tube = tube_area(inp.tubular_diameter_m * inp.design_outrigger_scale, inp.tubular_thickness_m * inp.design_outrigger_scale)
             arm_x = max((inp.plan_x - sec.core_x) / 2.0, 1.0)
             arm_y = max((inp.plan_y - sec.core_y) / 2.0, 1.0)
             Lx = sqrt(arm_x**2 + inp.outrigger_depth_m**2)
             Ly = sqrt(arm_y**2 + inp.outrigger_depth_m**2)
-            steel += 2 * inp.braced_spans_x * A_tube * Lx * RHO_STEEL
-            steel += 2 * inp.braced_spans_y * A_tube * Ly * RHO_STEEL
+            steel += 2 * len(active_braced_bays(inp, Direction.X)) * A_tube * Lx * RHO_STEEL
+            steel += 2 * len(active_braced_bays(inp, Direction.Y)) * A_tube * Ly * RHO_STEEL
         else:
             arm_x = max((inp.plan_x - sec.core_x) / 2.0, 1.0)
             arm_y = max((inp.plan_y - sec.core_y) / 2.0, 1.0)
-            steel += 2 * inp.braced_spans_x * (inp.outrigger_chord_area_m2 + inp.outrigger_diagonal_area_m2) * arm_x * RHO_STEEL
-            steel += 2 * inp.braced_spans_y * (inp.outrigger_chord_area_m2 + inp.outrigger_diagonal_area_m2) * arm_y * RHO_STEEL
+            steel += 2 * len(active_braced_bays(inp, Direction.X)) * (inp.outrigger_chord_area_m2 + inp.outrigger_diagonal_area_m2) * arm_x * RHO_STEEL
+            steel += 2 * len(active_braced_bays(inp, Direction.Y)) * (inp.outrigger_chord_area_m2 + inp.outrigger_diagonal_area_m2) * arm_y * RHO_STEEL
 
     structural_weight_kN = concrete * 25.0 + steel * G / 1000.0
     superimposed_kN = (
@@ -1543,38 +1594,45 @@ def plot_plan(res: DesignResult, zone_choice: str):
     ax.plot([inp.plan_x, inp.plan_x], [my - sec.side_wall_length_y/2, my + sec.side_wall_length_y/2], color="#4caf50", linewidth=5)
 
     zone_stories = [s.story for s in res.sections if s.zone == sec.zone]
-    outriggers_in_zone = [lev for lev in inp.outrigger_story_levels if lev in zone_stories]
+    outriggers_in_zone = [lev for lev in active_outrigger_levels(inp) if lev in zone_stories]
 
     if inp.outrigger_system != OutriggerSystem.NONE and outriggers_in_zone:
         # perimeter belt / collector
         ax.plot([0, inp.plan_x, inp.plan_x, 0, 0], [0, 0, inp.plan_y, inp.plan_y, 0],
                 color="#ff6b00", linewidth=3.0, alpha=0.75)
 
-        # Main outrigger arms from core to perimeter columns
-        ax.plot([0, cx0], [my, my], color="#ff6b00", linewidth=5)
-        ax.plot([cx1, inp.plan_x], [my, my], color="#ff6b00", linewidth=5)
-        ax.plot([mx, mx], [0, cy0], color="#ff6b00", linewidth=5)
-        ax.plot([mx, mx], [cy1, inp.plan_y], color="#ff6b00", linewidth=5)
+        # Real braced bay layout: braces are drawn inside actual grid bays, not randomly spread.
+        y_bays_for_x_resistance = active_braced_bays(inp, Direction.X)  # E/W strips, selected bay IDs along Y
+        x_bays_for_y_resistance = active_braced_bays(inp, Direction.Y)  # N/S strips, selected bay IDs along X
 
-        # Diagonal tubular bracing in the braced bays, shown in plan as dashed load paths
-        for y in np.linspace(my - sec.core_y/2, my + sec.core_y/2, max(inp.braced_spans_x, 1)):
-            ax.plot([0, cx0], [y - inp.outrigger_depth_m/2, my], color="#b34700", linewidth=2.4, linestyle="--")
-            ax.plot([0, cx0], [y + inp.outrigger_depth_m/2, my], color="#b34700", linewidth=2.4, linestyle="--")
-            ax.plot([inp.plan_x, cx1], [y - inp.outrigger_depth_m/2, my], color="#b34700", linewidth=2.4, linestyle="--")
-            ax.plot([inp.plan_x, cx1], [y + inp.outrigger_depth_m/2, my], color="#b34700", linewidth=2.4, linestyle="--")
+        for j in y_bays_for_x_resistance:
+            y0 = j * inp.bay_y
+            y1 = (j + 1) * inp.bay_y
+            yc = 0.5 * (y0 + y1)
+            ax.plot([0, cx0], [yc, yc], color="#ff6b00", linewidth=4.0)
+            ax.plot([cx1, inp.plan_x], [yc, yc], color="#ff6b00", linewidth=4.0)
+            ax.plot([0, inp.bay_x], [y0, y1], color="#b34700", linewidth=2.6)
+            ax.plot([0, inp.bay_x], [y1, y0], color="#b34700", linewidth=2.6)
+            ax.plot([inp.plan_x - inp.bay_x, inp.plan_x], [y0, y1], color="#b34700", linewidth=2.6)
+            ax.plot([inp.plan_x - inp.bay_x, inp.plan_x], [y1, y0], color="#b34700", linewidth=2.6)
 
-        for x in np.linspace(mx - sec.core_x/2, mx + sec.core_x/2, max(inp.braced_spans_y, 1)):
-            ax.plot([x - inp.outrigger_depth_m/2, mx], [0, cy0], color="#b34700", linewidth=2.4, linestyle="--")
-            ax.plot([x + inp.outrigger_depth_m/2, mx], [0, cy0], color="#b34700", linewidth=2.4, linestyle="--")
-            ax.plot([x - inp.outrigger_depth_m/2, mx], [inp.plan_y, cy1], color="#b34700", linewidth=2.4, linestyle="--")
-            ax.plot([x + inp.outrigger_depth_m/2, mx], [inp.plan_y, cy1], color="#b34700", linewidth=2.4, linestyle="--")
+        for i in x_bays_for_y_resistance:
+            x0 = i * inp.bay_x
+            x1 = (i + 1) * inp.bay_x
+            xc = 0.5 * (x0 + x1)
+            ax.plot([xc, xc], [0, cy0], color="#ff6b00", linewidth=4.0)
+            ax.plot([xc, xc], [cy1, inp.plan_y], color="#ff6b00", linewidth=4.0)
+            ax.plot([x0, x1], [0, inp.bay_y], color="#b34700", linewidth=2.6)
+            ax.plot([x1, x0], [0, inp.bay_y], color="#b34700", linewidth=2.6)
+            ax.plot([x0, x1], [inp.plan_y - inp.bay_y, inp.plan_y], color="#b34700", linewidth=2.6)
+            ax.plot([x1, x0], [inp.plan_y - inp.bay_y, inp.plan_y], color="#b34700", linewidth=2.6)
 
         ax.text(inp.plan_x + 2, inp.plan_y * 0.50,
-                f"OUTRIGGER LOAD PATH\nStories: {outriggers_in_zone}\n{inp.outrigger_system.value}\nBraced spans X/Y: {inp.braced_spans_x}/{inp.braced_spans_y}",
+                f"OUTRIGGER LOAD PATH\nActive stories: {outriggers_in_zone}\n{inp.outrigger_system.value}\nX braced bay IDs: {list(y_bays_for_x_resistance)}\nY braced bay IDs: {list(x_bays_for_y_resistance)}",
                 fontsize=9, color="#b34700", fontweight="bold", va="center")
     else:
         ax.text(inp.plan_x + 2, inp.plan_y * 0.50,
-                f"No outrigger in this displayed zone\nOutrigger stories: {list(inp.outrigger_story_levels)}",
+                f"No outrigger in this displayed zone\nOutrigger stories: {list(active_outrigger_levels(inp))}",
                 fontsize=9, color="#666666", va="center")
 
     ax.set_title(f"Plan view - {zone_choice} | Core + perimeter belt + tubular outrigger load path")
@@ -1597,7 +1655,7 @@ def plot_modes(res: DesignResult, direction: Direction):
         ax = axes[i]
         ax.plot(modal.mode_shapes[i], y, linewidth=2)
         ax.scatter(modal.mode_shapes[i], y, s=12)
-        for lev in res.input.outrigger_story_levels:
+        for lev in active_outrigger_levels(res.input):
             ax.axhline(lev * res.input.story_height, linestyle=":", alpha=0.6)
         ax.axvline(0, linestyle="--", linewidth=0.8)
         ax.set_title(f"Mode {i+1}\nT={modal.periods_s[i]:.3f}s")
@@ -1968,7 +2026,7 @@ def final_design_dashboard_table(res: DesignResult) -> pd.DataFrame:
         {"Component": "Corner columns", "Lower": f"{lower.column_corner_x:.2f} x {lower.column_corner_y:.2f} m", "Middle": f"{mid.column_corner_x:.2f} x {mid.column_corner_y:.2f} m", "Upper": f"{top.column_corner_x:.2f} x {top.column_corner_y:.2f} m"},
         {"Component": "Beams", "Lower": f"{lower.beam_b:.2f} x {lower.beam_h:.2f} m", "Middle": f"{mid.beam_b:.2f} x {mid.beam_h:.2f} m", "Upper": f"{top.beam_b:.2f} x {top.beam_h:.2f} m"},
         {"Component": "Slab", "Lower": f"{lower.slab_t:.2f} m", "Middle": f"{mid.slab_t:.2f} m", "Upper": f"{top.slab_t:.2f} m"},
-        {"Component": "Outrigger system", "Lower": res.input.outrigger_system.value, "Middle": f"Stories {list(res.input.outrigger_story_levels)}", "Upper": f"Braced spans X/Y = {res.input.braced_spans_x}/{res.input.braced_spans_y}"},
+        {"Component": "Outrigger system", "Lower": res.input.outrigger_system.value, "Middle": f"Stories {list(active_outrigger_levels(res.input))}", "Upper": f"Braced spans X/Y = {res.input.braced_spans_x}/{res.input.braced_spans_y}"},
         {"Component": "Quantities", "Lower": f"Concrete = {q_conc:,.0f} m³", "Middle": f"Steel = {q_steel:,.0f} kg", "Upper": "-"},
     ])
 
@@ -2059,14 +2117,15 @@ def streamlit_input_panel() -> BuildingInput:
         system = st.selectbox("Outrigger type", [OutriggerSystem.TUBULAR_BRACE.value, OutriggerSystem.BELT_TRUSS.value, OutriggerSystem.NONE.value])
         outrigger_count = st.number_input("Outrigger count", 0, 6, 2)
         outrigger_depth_m = st.number_input("Outrigger depth (m)", 1.0, 12.0, 3.0)
-        braced_spans_x = st.number_input("Braced spans X", 1, 20, 2)
-        braced_spans_y = st.number_input("Braced spans Y", 1, 20, 2)
+        braced_spans_x = st.number_input("Braced bays on each E/W side for X action", 0, 20, 2)
+        braced_spans_y = st.number_input("Braced bays on each N/S side for Y action", 0, 20, 2)
     with c12:
         tubular_diameter_m = st.number_input("Tube diameter D (m)", 0.10, 3.0, 0.80)
         tubular_thickness_m = st.number_input("Tube thickness t (m)", 0.005, 0.20, 0.030)
         outrigger_chord_area_m2 = st.number_input("Truss chord area (m²)", 0.001, 2.0, 0.08, format="%.4f")
         outrigger_diagonal_area_m2 = st.number_input("Truss diagonal area (m²)", 0.001, 2.0, 0.04, format="%.4f")
         outrigger_connection_efficiency = st.number_input("Connection efficiency", 0.10, 1.00, 0.75)
+        st.caption("Braced bays are real centered grid bays between columns, not randomly distributed lines.")
 
     levels = []
     if outrigger_count > 0:
