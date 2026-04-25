@@ -48,7 +48,7 @@ except Exception:
     scipy_eigh = None
 
 
-APP_VERSION = "v25.0-outrigger-span-stiffness-sum-method"
+APP_VERSION = "v26.0-direct-span-brace-sum-outrigger-stiffness"
 G = 9.81
 RHO_STEEL = 7850.0
 STEEL_E_MPA = 200000.0  # steel modulus for tubular/truss outrigger members
@@ -699,146 +699,131 @@ def active_outrigger_levels(inp: BuildingInput) -> Tuple[int, ...]:
     return tuple(levels[: int(inp.outrigger_count)])
 
 
-def outrigger_Ktheta(inp: BuildingInput, sec: StorySection, direction: Direction) -> float:
+def outrigger_span_basic_values(inp: BuildingInput, sec: StorySection, direction: Direction) -> Dict[str, float]:
     """
-    Outrigger rotational stiffness by span summation.
+    Direct brace-span stiffness method based on the user's sketch.
 
-    User-required method:
-        1. Select only real braced bay panels between column grid lines.
-        2. Calculate stiffness of one brace from EA/L and projection factor.
-        3. Multiply by the number of braces in the selected braced spans.
-        4. Convert the transferred axial stiffness into core rotational restraint.
+    One real braced bay panel is treated as an X-braced span between two columns.
+    For each diagonal brace:
+        k_diag = (Es * A / L) * cos²(theta)
+    The total outrigger line stiffness is:
+        K_out = k_diag * number_of_diagonal_braces
+    The rotational restraint added to the MDOF model is:
+        Ktheta = eta * K_out * lever_arm²
+
+    The same active braced bay IDs are used for drawing, stiffness, diagnostics,
+    and the MDOF matrix. No random spreading is used.
     """
-    if inp.outrigger_system == OutriggerSystem.NONE:
-        return 0.0
-    if sec.story not in active_outrigger_levels(inp):
-        return 0.0
-
-    E_steel = STEEL_E_MPA * 1e6
-    E_conc = inp.Ec * 1e6
-    eta = max(min(outrigger_efficiency(inp.outrigger_system) * inp.outrigger_connection_efficiency, 1.0), 0.05)
+    zero = {
+        "selected_bays": 0.0,
+        "total_braces": 0.0,
+        "bay_width_m": 0.0,
+        "brace_height_m": 0.0,
+        "brace_length_m": 0.0,
+        "cos2": 0.0,
+        "area_brace_m2": 0.0,
+        "k_one_brace_N_per_m": 0.0,
+        "k_out_total_N_per_m": 0.0,
+        "lever_arm_m": 0.0,
+        "Ktheta_Nm_per_rad": 0.0,
+    }
+    if inp.outrigger_system == OutriggerSystem.NONE or sec.story not in active_outrigger_levels(inp):
+        return zero
 
     if direction == Direction.X:
-        # X lateral response: selected braced panels are real bays along Y.
+        # X response: east/west outrigger sides, braced panels counted along Y.
         bay_width = max(inp.bay_y, 1e-9)
-        beam_span = max(inp.bay_y, 1e-9)
         bay_ids = active_braced_bays(inp, Direction.X)
         plan_dim = inp.plan_x
         core_dim = sec.core_x
     else:
-        # Y lateral response: selected braced panels are real bays along X.
+        # Y response: north/south outrigger sides, braced panels counted along X.
         bay_width = max(inp.bay_x, 1e-9)
-        beam_span = max(inp.bay_x, 1e-9)
         bay_ids = active_braced_bays(inp, Direction.Y)
         plan_dim = inp.plan_y
         core_dim = sec.core_y
 
     n_selected_bays = len(bay_ids)
     if n_selected_bays <= 0:
-        return 0.0
+        out = dict(zero)
+        out["bay_width_m"] = float(bay_width)
+        return out
 
-    # Lever arm from core face to the exterior braced column line.
-    lever_arm = max((plan_dim - core_dim) / 2.0, 1e-9)
-
-    # Braced panel geometry. The brace is inside a real bay panel, not a random line.
-    story_h = max(inp.story_height, 1e-9)
-    brace_depth = max(inp.outrigger_depth_m, story_h)
-    L_brace = sqrt(bay_width**2 + brace_depth**2)
-    cos2 = (bay_width / L_brace) ** 2
-
-    # Each X-braced bay has two diagonals. The same selected panels exist on two opposite sides.
-    braces_per_bay_per_side = 2.0
-    side_count = 2.0
-    n_braces_total = braces_per_bay_per_side * side_count * n_selected_bays
+    Es = STEEL_E_MPA * 1e6
+    eta = max(min(outrigger_efficiency(inp.outrigger_system) * inp.outrigger_connection_efficiency, 1.0), 0.0)
 
     if inp.outrigger_system == OutriggerSystem.TUBULAR_BRACE:
-        A_brace = tube_area(inp.tubular_diameter_m * inp.design_outrigger_scale,
-                            inp.tubular_thickness_m * inp.design_outrigger_scale)
-        A_chord = 0.35 * A_brace
+        A_brace = tube_area(
+            inp.tubular_diameter_m * inp.design_outrigger_scale,
+            inp.tubular_thickness_m * inp.design_outrigger_scale,
+        )
     else:
         A_brace = inp.outrigger_diagonal_area_m2 * inp.design_outrigger_scale
-        A_chord = inp.outrigger_chord_area_m2 * inp.design_outrigger_scale
 
-    # Main correction: total outrigger stiffness = stiffness of each brace times number of braces.
-    k_one_brace_projected = E_steel * A_brace / max(L_brace, 1e-9) * cos2
-    k_braces_total = n_braces_total * k_one_brace_projected
+    brace_height = max(inp.outrigger_depth_m, inp.story_height, 1e-9)
+    L_diag = sqrt(bay_width**2 + brace_height**2)
+    cos2 = (bay_width / L_diag) ** 2
 
-    # Secondary chord/belt axial path.
-    k_one_chord = E_steel * A_chord / max(lever_arm, 1e-9)
-    k_chords_total = side_count * n_selected_bays * 2.0 * k_one_chord
-    k_outrigger_span_sum = k_braces_total + k_chords_total
+    # Direct requested formula: stiffness of one brace times number of braces.
+    k_one_brace = Es * A_brace / L_diag * cos2
+    braces_per_bay_per_side = 2.0  # X brace = two diagonals
+    side_count = 2.0               # two opposite perimeter/outrigger sides
+    total_braces = braces_per_bay_per_side * side_count * n_selected_bays
+    k_out_total = total_braces * k_one_brace
 
-    # Collector/belt beams and exterior columns cap the transferred stiffness.
-    I_belt = sec.beam_b * sec.beam_h**3 / 12.0
-    k_one_collector_span = 12.0 * E_conc * I_belt / max(beam_span**3, 1e-9)
-    k_collector_total = side_count * n_selected_bays * k_one_collector_span
+    lever_arm = max((plan_dim - core_dim) / 2.0, 1e-9)
+    Ktheta = eta * k_out_total * lever_arm**2
 
-    A_col = sec.column_perimeter_x * sec.column_perimeter_y
-    A_corner = sec.column_corner_x * sec.column_corner_y
-    n_exterior_columns = side_count * (n_selected_bays + 1.0)
-    A_columns_total = n_exterior_columns * A_col + 0.25 * side_count * A_corner
-    L_col_eff = max(2.0 * story_h, brace_depth)
-    k_columns_total = E_conc * A_columns_total / max(L_col_eff, 1e-9)
+    return {
+        "selected_bays": float(n_selected_bays),
+        "total_braces": float(total_braces),
+        "bay_width_m": float(bay_width),
+        "brace_height_m": float(brace_height),
+        "brace_length_m": float(L_diag),
+        "cos2": float(cos2),
+        "area_brace_m2": float(A_brace),
+        "k_one_brace_N_per_m": float(k_one_brace),
+        "k_out_total_N_per_m": float(k_out_total),
+        "lever_arm_m": float(lever_arm),
+        "Ktheta_Nm_per_rad": float(Ktheta),
+    }
 
-    inv_k = (
-        1.0 / max(k_outrigger_span_sum, 1e-9)
-        + 1.0 / max(k_collector_total, 1e-9)
-        + 1.0 / max(k_columns_total, 1e-9)
-    )
-    k_transfer = 1.0 / inv_k
 
-    return float(max(eta * k_transfer * lever_arm**2, 0.0))
+def outrigger_Ktheta(inp: BuildingInput, sec: StorySection, direction: Direction) -> float:
+    """Rotational restraint: Ktheta = eta * sum(Es*A/L*cos²theta) * lever_arm²."""
+    return outrigger_span_basic_values(inp, sec, direction)["Ktheta_Nm_per_rad"]
 
 
 def outrigger_span_stiffness_components(inp: BuildingInput, sec: StorySection, direction: Direction) -> Dict[str, float]:
-    """Diagnostic values for checking the span-summation outrigger method."""
-    if inp.outrigger_system == OutriggerSystem.NONE or sec.story not in active_outrigger_levels(inp):
-        return {"selected_bays": 0.0, "total_braces": 0.0, "k_one_brace_MN_per_m": 0.0,
-                "k_braces_total_MN_per_m": 0.0, "Ktheta_GNm_per_rad": 0.0}
-    if direction == Direction.X:
-        bay_width = max(inp.bay_y, 1e-9)
-        bay_ids = active_braced_bays(inp, Direction.X)
-    else:
-        bay_width = max(inp.bay_x, 1e-9)
-        bay_ids = active_braced_bays(inp, Direction.Y)
-    n_selected_bays = len(bay_ids)
-    brace_depth = max(inp.outrigger_depth_m, inp.story_height)
-    L_brace = sqrt(bay_width**2 + brace_depth**2)
-    cos2 = (bay_width / L_brace) ** 2
-    if inp.outrigger_system == OutriggerSystem.TUBULAR_BRACE:
-        A_brace = tube_area(inp.tubular_diameter_m * inp.design_outrigger_scale,
-                            inp.tubular_thickness_m * inp.design_outrigger_scale)
-    else:
-        A_brace = inp.outrigger_diagonal_area_m2 * inp.design_outrigger_scale
-    k_one = STEEL_E_MPA * 1e6 * A_brace / max(L_brace, 1e-9) * cos2
-    n_braces = 2.0 * 2.0 * n_selected_bays
-    return {"selected_bays": float(n_selected_bays),
-            "total_braces": float(n_braces),
-            "k_one_brace_MN_per_m": float(k_one / 1e6),
-            "k_braces_total_MN_per_m": float(n_braces * k_one / 1e6),
-            "Ktheta_GNm_per_rad": float(outrigger_Ktheta(inp, sec, direction) / 1e9)}
+    """Diagnostic values for the direct brace-span summation method."""
+    v = outrigger_span_basic_values(inp, sec, direction)
+    return {
+        "selected_bays": v["selected_bays"],
+        "total_braces": v["total_braces"],
+        "k_one_brace_MN_per_m": v["k_one_brace_N_per_m"] / 1e6,
+        "k_braces_total_MN_per_m": v["k_out_total_N_per_m"] / 1e6,
+        "Ktheta_GNm_per_rad": v["Ktheta_Nm_per_rad"] / 1e9,
+        "bay_width_m": v["bay_width_m"],
+        "brace_length_m": v["brace_length_m"],
+        "lever_arm_m": v["lever_arm_m"],
+    }
+
+
 def outrigger_Klateral(inp: BuildingInput, sec: StorySection, direction: Direction) -> float:
     """
-    Equivalent lateral spring at the outrigger floor.
+    Equivalent translational stiffness from the same summed brace stiffness.
 
-    In a 2-DOF-per-floor flexural stick model, the main outrigger effect is core
-    rotational restraint. A small equivalent lateral spring is added only to
-    represent belt/collector coupling to exterior braced column lines. It is
-    deliberately limited so it cannot create an unrealistic period collapse.
+    A reduced stick model may hide part of the outrigger effect if only a nodal
+    rotational spring is used. Therefore the same K_out is also added as a
+    conservative translational coupling spring at the outrigger floor.
     """
-    if inp.outrigger_system == OutriggerSystem.NONE:
+    v = outrigger_span_basic_values(inp, sec, direction)
+    k_out = v["k_out_total_N_per_m"]
+    if k_out <= 0.0:
         return 0.0
-    if sec.story not in active_outrigger_levels(inp):
-        return 0.0
-
-    h_level = max(sec.elevation_m, inp.story_height)
-    ktheta = outrigger_Ktheta(inp, sec, direction)
-    if ktheta <= 0.0:
-        return 0.0
-
-    n_spans = max(len(active_braced_bays(inp, direction)), 1)
-    participation = min(0.30 + 0.07 * n_spans, 0.65)
-    return float(participation * ktheta / (h_level ** 2))
+    eta = max(min(outrigger_efficiency(inp.outrigger_system) * inp.outrigger_connection_efficiency, 1.0), 0.0)
+    translational_participation = 0.20
+    return float(translational_participation * eta * k_out)
 
 def story_mass_and_quantities(inp: BuildingInput, sec: StorySection) -> Tuple[float, float, float, float]:
     A_floor = inp.floor_area
