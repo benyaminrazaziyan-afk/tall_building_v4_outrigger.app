@@ -44,9 +44,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
-APP_VERSION = "v14.0-ASCE-compliant-drift-controlled-MDOF"
+APP_VERSION = "v15.0-ASCE-outrigger-effect-verified"
 G = 9.81
 RHO_STEEL = 7850.0
+STEEL_E_MPA = 200000.0  # steel modulus for tubular/truss outrigger members
 
 
 # ============================================================
@@ -561,7 +562,7 @@ def outrigger_Ktheta(inp: BuildingInput, sec: StorySection, direction: Direction
     if sec.story not in inp.outrigger_story_levels:
         return 0.0
 
-    E = inp.Ec * 1e6
+    E = STEEL_E_MPA * 1e6  # outrigger braces/truss members are steel, not concrete
     eta = outrigger_efficiency(inp.outrigger_system) * inp.outrigger_connection_efficiency
 
     if direction == Direction.X:
@@ -1461,6 +1462,14 @@ def build_report(res: DesignResult) -> str:
     lines.append("-" * 96)
     lines.append(outrigger_design_table(res).to_string(index=False))
     lines.append("")
+    lines.append("3D. Outrigger effect comparison")
+    lines.append("-" * 96)
+    lines.append(outrigger_effect_comparison(res).to_string(index=False))
+    lines.append("")
+    lines.append("3E. Outrigger stiffness diagnostic")
+    lines.append("-" * 96)
+    lines.append(outrigger_stiffness_diagnostic_table(res).to_string(index=False))
+    lines.append("")
     lines.append("3C. Design checks")
     lines.append("-" * 96)
     lines.append(design_check_table(res).to_string(index=False))
@@ -1502,8 +1511,8 @@ def outrigger_design_table(res: DesignResult) -> pd.DataFrame:
             area = tube_area(inp.tubular_diameter_m, inp.tubular_thickness_m)
             Lx = sqrt(arm_x**2 + inp.outrigger_depth_m**2)
             Ly = sqrt(arm_y**2 + inp.outrigger_depth_m**2)
-            kax_x = 2.0 * inp.braced_spans_x * inp.Ec * 1e6 * area / Lx
-            kax_y = 2.0 * inp.braced_spans_y * inp.Ec * 1e6 * area / Ly
+            kax_x = 2.0 * inp.braced_spans_x * STEEL_E_MPA * 1e6 * area / Lx
+            kax_y = 2.0 * inp.braced_spans_y * STEEL_E_MPA * 1e6 * area / Ly
             steel_x = 2.0 * inp.braced_spans_x * area * Lx * RHO_STEEL
             steel_y = 2.0 * inp.braced_spans_y * area * Ly * RHO_STEEL
 
@@ -1598,10 +1607,84 @@ def design_principles_table(res: DesignResult) -> pd.DataFrame:
         },
         {
             "Principle": "Outrigger modeling",
-            "Implemented rule": "Tubular or truss outrigger is converted to rotational restraint Ktheta at real outrigger stories.",
+            "Implemented rule": "Tubular or truss outrigger is converted to rotational restraint Ktheta at real outrigger stories using steel modulus Es=200000 MPa.",
             "Engineering meaning": "Outrigger resists core rotation through axial action, not by fake lateral springs."
         },
     ])
+
+
+
+def without_outrigger_input(inp: BuildingInput) -> BuildingInput:
+    return replace(
+        inp,
+        outrigger_system=OutriggerSystem.NONE,
+        outrigger_count=0,
+        outrigger_story_levels=tuple(),
+        auto_redesign=False,
+    )
+
+
+def outrigger_effect_comparison(res: DesignResult) -> pd.DataFrame:
+    """
+    Compare final designed structure with and without the outrigger, keeping the same
+    final member sizes. This isolates the structural effect of the outrigger itself.
+    """
+    with_res = evaluate(res.input)
+    no_out_res = evaluate(without_outrigger_input(res.input))
+
+    rows = []
+    for label, r_with, r_without, m_with, m_without in [
+        ("X direction", with_res.rsa_x, no_out_res.rsa_x, with_res.modal_x, no_out_res.modal_x),
+        ("Y direction", with_res.rsa_y, no_out_res.rsa_y, with_res.modal_y, no_out_res.modal_y),
+    ]:
+        T_with = m_with.periods_s[0]
+        T_without = m_without.periods_s[0]
+        drift_with = float(np.max(r_with.drift_ratio))
+        drift_without = float(np.max(r_without.drift_ratio))
+        disp_with = float(np.max(np.abs(r_with.displacement_m)))
+        disp_without = float(np.max(np.abs(r_without.displacement_m)))
+
+        rows.append({
+            "Direction": label,
+            "T with outrigger (s)": T_with,
+            "T without outrigger (s)": T_without,
+            "Period reduction (%)": 100.0 * (T_without - T_with) / max(T_without, 1e-9),
+            "Max drift with": drift_with,
+            "Max drift without": drift_without,
+            "Drift reduction (%)": 100.0 * (drift_without - drift_with) / max(drift_without, 1e-12),
+            "Roof disp with (m)": disp_with,
+            "Roof disp without (m)": disp_without,
+            "Displacement reduction (%)": 100.0 * (disp_without - disp_with) / max(disp_without, 1e-12),
+        })
+    return pd.DataFrame(rows)
+
+
+def outrigger_stiffness_diagnostic_table(res: DesignResult) -> pd.DataFrame:
+    """
+    Compare Ktheta with local story rotational stiffness order 4EI/L.
+    If Ktheta/(4EI/L) is very small, the outrigger cannot strongly affect the global period.
+    """
+    rows = []
+    inp = res.input
+    if inp.outrigger_system == OutriggerSystem.NONE:
+        return pd.DataFrame([{"Message": "No outrigger is active."}])
+
+    for lev in inp.outrigger_story_levels:
+        idx = min(max(int(lev), 1), inp.n_story) - 1
+        prop = res.properties[idx]
+        story_rot_x = 4.0 * prop.EI_x_Nm2 / max(inp.story_height, 1e-9)
+        story_rot_y = 4.0 * prop.EI_y_Nm2 / max(inp.story_height, 1e-9)
+        rows.append({
+            "Outrigger story": lev,
+            "Ktheta X (GN.m/rad)": prop.Ktheta_out_x_Nm / 1e9,
+            "4EI/L X (GN.m/rad)": story_rot_x / 1e9,
+            "Ktheta/(4EI/L) X": prop.Ktheta_out_x_Nm / max(story_rot_x, 1e-9),
+            "Ktheta Y (GN.m/rad)": prop.Ktheta_out_y_Nm / 1e9,
+            "4EI/L Y (GN.m/rad)": story_rot_y / 1e9,
+            "Ktheta/(4EI/L) Y": prop.Ktheta_out_y_Nm / max(story_rot_y, 1e-9),
+            "Interpretation": "strong" if max(prop.Ktheta_out_x_Nm / max(story_rot_x, 1e-9), prop.Ktheta_out_y_Nm / max(story_rot_y, 1e-9)) > 0.25 else "weak/moderate",
+        })
+    return pd.DataFrame(rows)
 
 
 def final_design_dashboard_table(res: DesignResult) -> pd.DataFrame:
@@ -1920,6 +2003,7 @@ def main():
             [
                 "PRINCIPLES",
                 "FINAL DESIGN",
+                "OUTRIGGER EFFECT",
                 "OUTRIGGER DESIGN",
                 "DESIGN CHECKS",
                 "Summary",
@@ -1948,32 +2032,39 @@ def main():
             st.dataframe(summary_table(res), use_container_width=True, hide_index=True)
 
         with tabs[2]:
+            st.markdown("### With vs without outrigger comparison")
+            st.dataframe(outrigger_effect_comparison(res), use_container_width=True, hide_index=True)
+            st.markdown("### Outrigger stiffness diagnostic")
+            st.dataframe(outrigger_stiffness_diagnostic_table(res), use_container_width=True, hide_index=True)
+            st.caption("If Ktheta/(4EI/L) is very small, the outrigger cannot significantly change the global period.")
+
+        with tabs[3]:
             st.markdown("### Outrigger design result")
             st.dataframe(outrigger_design_table(res), use_container_width=True, hide_index=True)
             st.caption("Ktheta is the rotational restraint added to the flexural MDOF solver at the real outrigger levels.")
 
-        with tabs[3]:
+        with tabs[4]:
             st.markdown("### Design checks")
             st.dataframe(design_check_table(res), use_container_width=True, hide_index=True)
 
-        with tabs[4]:
+        with tabs[5]:
             st.dataframe(summary_table(res), use_container_width=True, hide_index=True)
 
-        with tabs[5]:
+        with tabs[6]:
             st.dataframe(final_dimensions_table(res), use_container_width=True, hide_index=True)
 
-        with tabs[6]:
+        with tabs[7]:
             st.pyplot(plot_plan(res, zone_name), use_container_width=True)
 
-        with tabs[7]:
+        with tabs[8]:
             st.pyplot(plot_modes(res, Direction.X), use_container_width=True)
             st.dataframe(modal_table(res.modal_x), use_container_width=True, hide_index=True)
 
-        with tabs[8]:
+        with tabs[9]:
             st.pyplot(plot_modes(res, Direction.Y), use_container_width=True)
             st.dataframe(modal_table(res.modal_y), use_container_width=True, hide_index=True)
 
-        with tabs[9]:
+        with tabs[10]:
             p1, p2 = st.columns(2)
             with p1:
                 st.pyplot(plot_story_response(res, Direction.X, "Story shear"), use_container_width=True)
@@ -1981,7 +2072,7 @@ def main():
                 st.pyplot(plot_story_response(res, Direction.X, "Drift ratio"), use_container_width=True)
             st.dataframe(story_response_table(res, Direction.X), use_container_width=True, hide_index=True)
 
-        with tabs[10]:
+        with tabs[11]:
             p1, p2 = st.columns(2)
             with p1:
                 st.pyplot(plot_story_response(res, Direction.Y, "Story shear"), use_container_width=True)
@@ -1989,27 +2080,27 @@ def main():
                 st.pyplot(plot_story_response(res, Direction.Y, "Drift ratio"), use_container_width=True)
             st.dataframe(story_response_table(res, Direction.Y), use_container_width=True, hide_index=True)
 
-        with tabs[11]:
+        with tabs[12]:
             st.pyplot(plot_stiffness(res), use_container_width=True)
             st.dataframe(stiffness_table(res), use_container_width=True, hide_index=True)
 
-        with tabs[12]:
+        with tabs[13]:
             st.pyplot(plot_spectrum(res.input), use_container_width=True)
             st.dataframe(spectrum_table(res.input), use_container_width=True, hide_index=True)
 
-        with tabs[13]:
+        with tabs[14]:
             fig = plot_iteration(res)
             if fig is not None:
                 st.pyplot(fig, use_container_width=True)
             st.dataframe(res.iteration_table, use_container_width=True, hide_index=True)
 
-        with tabs[14]:
+        with tabs[15]:
             st.markdown("### Story sections")
             st.dataframe(pd.DataFrame([s.__dict__ for s in res.sections]), use_container_width=True, hide_index=True)
             st.markdown("### Story properties")
             st.dataframe(pd.DataFrame([p.__dict__ for p in res.properties]), use_container_width=True, hide_index=True)
 
-        with tabs[15]:
+        with tabs[16]:
             st.text_area("Report", st.session_state.v13_report, height=600)
 
 
