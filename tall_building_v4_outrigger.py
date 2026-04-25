@@ -1,5 +1,5 @@
 """
-Tall Building Outrigger Predesign Framework - Version 4.1
+Tall Building Outrigger Predesign Framework - Version 4.4
 =========================================================
 
 A preliminary structural engineering tool for comparing tall-building lateral
@@ -36,7 +36,7 @@ except Exception:
     scipy_eigh = None
 
 
-APP_VERSION = "4.4-reviewed-preliminary-framework"
+APP_VERSION = "4.4-reviewed-engineering-patch"
 PROJECT_TITLE = "Tall Building Outrigger Predesign Framework"
 AUTHOR_NAME = "BENYAMIN RAZAZIYAN"
 G = 9.81
@@ -186,6 +186,11 @@ class BuildingInput:
     braced_bay_ids_x: Tuple[int, ...] = ()  # X action: bay IDs along Y on E/W sides
     braced_bay_ids_y: Tuple[int, ...] = ()  # Y action: bay IDs along X on N/S sides
     outrigger_connection_efficiency: float = 0.75
+    # Engineering calibration factors for preliminary stick models.
+    # The full diagonal EA/L is not allowed to act as a direct floor-to-ground lateral spring.
+    # It is first reduced for connection, floor diaphragm, collector, brace-panel, and column-line flexibility.
+    outrigger_effectiveness_factor: float = 0.25
+    outrigger_lateral_participation: float = 0.05
 
     # Criteria
     drift_limit_ratio: float = 0.015
@@ -202,6 +207,7 @@ class BuildingInput:
     max_iterations: int = 12
     growth_limit_per_iteration: float = 1.12
     reduction_limit_per_iteration: float = 0.96
+    allow_section_reduction: bool = False
 
     # Internal redesign scale factors.
     # The UI normally leaves these at 1.0. The redesign loop updates them.
@@ -858,7 +864,7 @@ def outrigger_span_basic_values(inp: BuildingInput, sec: StorySection, direction
         return out
 
     Es = STEEL_E_MPA * 1e6
-    eta = max(min(outrigger_efficiency(inp.outrigger_system) * inp.outrigger_connection_efficiency, 1.0), 0.0)
+    eta = max(min(outrigger_efficiency(inp.outrigger_system) * inp.outrigger_connection_efficiency * inp.outrigger_effectiveness_factor, 1.0), 0.0)
 
     if inp.outrigger_system == OutriggerSystem.TUBULAR_BRACE:
         A_brace = tube_area(
@@ -918,39 +924,56 @@ def outrigger_span_stiffness_components(inp: BuildingInput, sec: StorySection, d
 
 
 def outrigger_Klateral(inp: BuildingInput, sec: StorySection, direction: Direction) -> float:
-    """Diagnostic K_uu term of the condensed outrigger stiffness matrix."""
+    """
+    Diagnostic translational part of the outrigger stiffness.
+
+    Important engineering correction in v4.4 patch:
+    A core-outrigger system mainly provides rotational restraint to the core through
+    an axial couple in the exterior columns. It is not a full direct lateral support
+    to ground at the outrigger floor. Therefore only a small, user-controlled
+    fraction of the projected brace stiffness is permitted to enter the lateral
+    displacement DOF.
+    """
     v = outrigger_span_basic_values(inp, sec, direction)
     k_out = v["k_out_total_N_per_m"]
     if k_out <= 0.0:
         return 0.0
-    eta = max(min(outrigger_efficiency(inp.outrigger_system) * inp.outrigger_connection_efficiency, 1.0), 0.0)
-    return float(eta * k_out)
-
+    eta = max(min(outrigger_efficiency(inp.outrigger_system) * inp.outrigger_connection_efficiency * inp.outrigger_effectiveness_factor, 1.0), 0.0)
+    lateral_part = max(min(inp.outrigger_lateral_participation, 0.25), 0.0)
+    return float(eta * lateral_part * k_out)
 
 def outrigger_coupled_matrix(inp: BuildingInput, sec: StorySection, direction: Direction) -> np.ndarray:
     """
     Condensed engineering stiffness added to the floor DOFs [u, theta].
 
-    The braced-bay stiffness follows the method requested from the sketch:
-        K_out = sum((E_s A_b / L_b) cos^2(theta_b))
+    Corrected v4.4 engineering patch:
+    - Brace-panel stiffness is still calculated from the real braced spans:
+          K_out = sum((E_s A_b / L_b) cos^2(theta_b))
+    - The dominant physical contribution is core rotational restraint:
+          K_theta = eta * K_out * a^2
+    - A small translational term is allowed only as diaphragm/collector participation:
+          K_uu = eta * alpha_lat * K_out
+    - The coupling term is bounded for positive-definiteness:
+          K_uθ = beta * sqrt(K_uu * K_theta)
 
-    Compatibility at the core floor is taken as:
-        delta = u_floor + lever_arm * theta_floor
-
-    So the energy U = 0.5 * eta * K_out * delta^2 gives:
-        K_add = eta K_out [[1, a], [a, a^2]]
-
-    This is intentionally different from the previous local spring treatment;
-    the off-diagonal terms make the outrigger participate in the global matrix.
+    This prevents the outrigger from acting as an unrealistic floor-to-ground
+    lateral spring, which previously caused excessive period reduction.
     """
     v = outrigger_span_basic_values(inp, sec, direction)
     k_out = v["k_out_total_N_per_m"]
     a = v["lever_arm_m"]
     if k_out <= 0.0 or a <= 0.0:
         return np.zeros((2, 2), dtype=float)
-    eta = max(min(outrigger_efficiency(inp.outrigger_system) * inp.outrigger_connection_efficiency, 1.0), 0.0)
-    k = eta * k_out
-    return k * np.array([[1.0, a], [a, a * a]], dtype=float)
+
+    eta = max(min(outrigger_efficiency(inp.outrigger_system) * inp.outrigger_connection_efficiency * inp.outrigger_effectiveness_factor, 1.0), 0.0)
+    alpha_lat = max(min(inp.outrigger_lateral_participation, 0.25), 0.0)
+    beta_couple = 0.50
+
+    k_uu = eta * alpha_lat * k_out
+    k_tt = eta * k_out * a * a
+    k_ut = beta_couple * sqrt(max(k_uu * k_tt, 0.0))
+
+    return np.array([[k_uu, k_ut], [k_ut, k_tt]], dtype=float)
 
 def story_mass_and_quantities(inp: BuildingInput, sec: StorySection) -> Tuple[float, float, float, float]:
     A_floor = inp.floor_area
@@ -1478,6 +1501,11 @@ def run_design(inp: BuildingInput) -> DesignResult:
                 "Beam scale": beam_scale,
                 "Slab scale": slab_scale,
                 "Outrigger scale": out_scale,
+                "Wall cracked factor": current_inp.wall_cracked_factor,
+                "Column cracked factor": current_inp.column_cracked_factor,
+                "Side wall cracked factor": current_inp.side_wall_cracked_factor,
+                "Outrigger effectiveness": current_inp.outrigger_effectiveness_factor,
+                "Outrigger lateral participation": current_inp.outrigger_lateral_participation,
                 "T_modal X (s)": res.modal_x.periods_s[0],
                 "T_modal Y (s)": res.modal_y.periods_s[0],
                 "Ta X/Y reference (s)": res.rsa_x.Ta_s,
@@ -1524,11 +1552,22 @@ def run_design(inp: BuildingInput) -> DesignResult:
             slab_scale *= min(1.06, drift_ratio_over ** 0.06)
             out_scale *= min(1.20, drift_ratio_over ** 0.20)
         elif drift_ratio_over < 0.35:
-            wall_scale *= inp.reduction_limit_per_iteration
-            col_scale *= inp.reduction_limit_per_iteration
-            beam_scale *= max(inp.reduction_limit_per_iteration, 0.97)
-            slab_scale *= max(inp.reduction_limit_per_iteration, 0.98)
-            out_scale *= max(inp.reduction_limit_per_iteration, 0.96)
+            # Conservative research setting: do not automatically shrink sections
+            # unless the user explicitly permits optimization. This prevents
+            # misleading behavior where increasing redesign iterations makes
+            # the structure smaller only because drift is far below the limit.
+            if inp.allow_section_reduction:
+                wall_scale *= inp.reduction_limit_per_iteration
+                col_scale *= inp.reduction_limit_per_iteration
+                beam_scale *= max(inp.reduction_limit_per_iteration, 0.97)
+                slab_scale *= max(inp.reduction_limit_per_iteration, 0.98)
+                out_scale *= max(inp.reduction_limit_per_iteration, 0.96)
+            else:
+                wall_scale *= 1.0
+                col_scale *= 1.0
+                beam_scale *= 1.0
+                slab_scale *= 1.0
+                out_scale *= 1.0
 
         wall_scale = float(np.clip(wall_scale, 0.40, 3.50))
         col_scale = float(np.clip(col_scale, 0.40, 3.50))
@@ -2088,6 +2127,11 @@ def design_principles_table(res: DesignResult) -> pd.DataFrame:
             "Engineering meaning": "Enough modes must be included for a valid modal response estimate."
         },
         {
+            "Principle": "Cracked stiffness",
+            "Implemented rule": "Effective EI is computed from Ec × Ig × cracked stiffness factors for walls, columns, side walls, and retaining walls.",
+            "Engineering meaning": "Changing cracked stiffness factors directly changes the global stiffness matrix, modal period, and drift response."
+        },
+        {
             "Principle": "Outrigger modeling",
             "Implemented rule": "Tubular/truss braced bay panels are summed as K_out = sum(EA/L*cos²θ), then condensed to [u, theta] floor DOFs with lever-arm coupling.",
             "Engineering meaning": "Outrigger stiffness enters the global stiffness matrix through the same braced bays shown in the plan."
@@ -2298,7 +2342,9 @@ def streamlit_input_panel() -> BuildingInput:
         outrigger_chord_area_m2 = st.number_input("Truss chord area (m²)", 0.001, 2.0, 0.08, format="%.4f")
         outrigger_diagonal_area_m2 = st.number_input("Truss diagonal area (m²)", 0.001, 2.0, 0.04, format="%.4f")
         outrigger_connection_efficiency = st.number_input("Connection efficiency", 0.10, 1.00, 0.75)
-        st.caption("Braced bays are real centered grid bays between columns, not randomly distributed lines.")
+        outrigger_effectiveness_factor = st.number_input("Outrigger effectiveness factor", 0.05, 0.60, 0.25)
+        outrigger_lateral_participation = st.number_input("Outrigger lateral participation", 0.00, 0.25, 0.05)
+        st.caption("Braced bays are real centered grid bays. The full EA/L is reduced before entering the global MDOF matrix.")
 
     levels = []
     if outrigger_count > 0:
@@ -2353,6 +2399,7 @@ def streamlit_input_panel() -> BuildingInput:
         max_iterations = st.number_input("Max redesign iterations", 1, 40, 12)
         growth_limit = st.number_input("Growth limit per iteration", 1.01, 1.50, 1.12)
         reduction_limit = st.number_input("Reduction limit per iteration", 0.70, 0.99, 0.96)
+        allow_section_reduction = st.checkbox("Allow automatic section reduction", False)
 
     def _parse_bay_ids(txt: str) -> Tuple[int, ...]:
         vals: List[int] = []
@@ -2428,6 +2475,8 @@ def streamlit_input_panel() -> BuildingInput:
         braced_bay_ids_x=_parse_bay_ids(braced_bay_ids_x_txt),
         braced_bay_ids_y=_parse_bay_ids(braced_bay_ids_y_txt),
         outrigger_connection_efficiency=float(outrigger_connection_efficiency),
+        outrigger_effectiveness_factor=float(outrigger_effectiveness_factor),
+        outrigger_lateral_participation=float(outrigger_lateral_participation),
         drift_limit_ratio=float(drift_limit_ratio),
         minimum_modal_mass_ratio=float(minimum_modal_mass_ratio),
         n_modes=int(n_modes),
@@ -2444,6 +2493,7 @@ def streamlit_input_panel() -> BuildingInput:
         max_iterations=int(max_iterations),
         growth_limit_per_iteration=float(growth_limit),
         reduction_limit_per_iteration=float(reduction_limit),
+        allow_section_reduction=bool(allow_section_reduction),
     )
 
 
