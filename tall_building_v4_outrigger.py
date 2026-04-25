@@ -44,7 +44,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
-APP_VERSION = "v15.0-ASCE-outrigger-effect-verified"
+APP_VERSION = "v16.0-outrigger-loadpath-plan-fixed"
 G = 9.81
 RHO_STEEL = 7850.0
 STEEL_E_MPA = 200000.0  # steel modulus for tubular/truss outrigger members
@@ -557,12 +557,20 @@ def outrigger_efficiency(system: OutriggerSystem) -> float:
 
 
 def outrigger_Ktheta(inp: BuildingInput, sec: StorySection, direction: Direction) -> float:
+    """
+    Outrigger rotational restraint from the real load path:
+    exterior columns/belt collector -> tubular braces/truss arms -> central core wall.
+
+    Key correction:
+    Outrigger members are steel, so Es = 200000 MPa is used.
+    Multiple braced spans and belt continuity are included.
+    """
     if inp.outrigger_system == OutriggerSystem.NONE:
         return 0.0
     if sec.story not in inp.outrigger_story_levels:
         return 0.0
 
-    E = STEEL_E_MPA * 1e6  # outrigger braces/truss members are steel, not concrete
+    E = STEEL_E_MPA * 1e6
     eta = outrigger_efficiency(inp.outrigger_system) * inp.outrigger_connection_efficiency
 
     if direction == Direction.X:
@@ -572,18 +580,20 @@ def outrigger_Ktheta(inp: BuildingInput, sec: StorySection, direction: Direction
         arm = max((inp.plan_y - sec.core_y) / 2.0, 1.0)
         n_spans = max(inp.braced_spans_y, 1)
 
+    L_diag = sqrt(arm**2 + inp.outrigger_depth_m**2)
+    belt_factor = 1.0 + 0.35 * max(n_spans - 1, 0)
+
     if inp.outrigger_system == OutriggerSystem.TUBULAR_BRACE:
         A = tube_area(inp.tubular_diameter_m, inp.tubular_thickness_m)
-        L = sqrt(arm**2 + inp.outrigger_depth_m**2)
-        k_ax = 2.0 * n_spans * E * A / L
+        angle_factor = (arm / L_diag) ** 2
+        # four arms: two opposite sides and paired diagonal action
+        k_ax = 4.0 * n_spans * E * A / L_diag * belt_factor * angle_factor
     else:
-        L = sqrt(arm**2 + inp.outrigger_depth_m**2)
-        k_chord = 2.0 * n_spans * E * inp.outrigger_chord_area_m2 / max(arm, 1e-9)
-        k_diag = 2.0 * n_spans * E * inp.outrigger_diagonal_area_m2 / L
-        k_ax = k_chord + k_diag
+        k_chord = 4.0 * n_spans * E * inp.outrigger_chord_area_m2 / max(arm, 1e-9)
+        k_diag = 4.0 * n_spans * E * inp.outrigger_diagonal_area_m2 / L_diag
+        k_ax = (k_chord + k_diag) * belt_factor
 
     return eta * k_ax * arm**2
-
 
 def story_mass_and_quantities(inp: BuildingInput, sec: StorySection) -> Tuple[float, float, float, float]:
     A_floor = inp.floor_area
@@ -1270,7 +1280,7 @@ def stiffness_table(res: DesignResult) -> pd.DataFrame:
 def plot_plan(res: DesignResult, zone_choice: str):
     sec = next((s for s in res.sections if s.zone == zone_choice), res.sections[0])
     inp = res.input
-    fig, ax = plt.subplots(figsize=(12, 8))
+    fig, ax = plt.subplots(figsize=(13, 9))
 
     ax.plot([0, inp.plan_x, inp.plan_x, 0, 0], [0, 0, inp.plan_y, inp.plan_y, 0], color="black", linewidth=1.5)
 
@@ -1297,33 +1307,66 @@ def plot_plan(res: DesignResult, zone_choice: str):
 
     cx0 = (inp.plan_x - sec.core_x) / 2
     cy0 = (inp.plan_y - sec.core_y) / 2
-    ax.add_patch(plt.Rectangle((cx0, cy0), sec.core_x, sec.core_y, fill=False, edgecolor="#2e8b57", linewidth=2.5))
+    cx1 = cx0 + sec.core_x
+    cy1 = cy0 + sec.core_y
+    mx, my = inp.plan_x / 2, inp.plan_y / 2
+
+    # Core wall box
+    ax.add_patch(plt.Rectangle((cx0, cy0), sec.core_x, sec.core_y, fill=False, edgecolor="#2e8b57", linewidth=2.8))
     ax.add_patch(plt.Rectangle((cx0, cy0), sec.core_x, sec.core_wall_t, facecolor="#2e8b57", alpha=0.25))
-    ax.add_patch(plt.Rectangle((cx0, cy0 + sec.core_y - sec.core_wall_t), sec.core_x, sec.core_wall_t, facecolor="#2e8b57", alpha=0.25))
+    ax.add_patch(plt.Rectangle((cx0, cy1 - sec.core_wall_t), sec.core_x, sec.core_wall_t, facecolor="#2e8b57", alpha=0.25))
     ax.add_patch(plt.Rectangle((cx0, cy0), sec.core_wall_t, sec.core_y, facecolor="#2e8b57", alpha=0.25))
-    ax.add_patch(plt.Rectangle((cx0 + sec.core_x - sec.core_wall_t, cy0), sec.core_wall_t, sec.core_y, facecolor="#2e8b57", alpha=0.25))
+    ax.add_patch(plt.Rectangle((cx1 - sec.core_wall_t, cy0), sec.core_wall_t, sec.core_y, facecolor="#2e8b57", alpha=0.25))
 
-    # side walls
-    ax.plot([inp.plan_x/2 - sec.side_wall_length_x/2, inp.plan_x/2 + sec.side_wall_length_x/2], [0, 0], color="#4caf50", linewidth=5)
-    ax.plot([inp.plan_x/2 - sec.side_wall_length_x/2, inp.plan_x/2 + sec.side_wall_length_x/2], [inp.plan_y, inp.plan_y], color="#4caf50", linewidth=5)
-    ax.plot([0, 0], [inp.plan_y/2 - sec.side_wall_length_y/2, inp.plan_y/2 + sec.side_wall_length_y/2], color="#4caf50", linewidth=5)
-    ax.plot([inp.plan_x, inp.plan_x], [inp.plan_y/2 - sec.side_wall_length_y/2, inp.plan_y/2 + sec.side_wall_length_y/2], color="#4caf50", linewidth=5)
+    # Side walls
+    ax.plot([mx - sec.side_wall_length_x/2, mx + sec.side_wall_length_x/2], [0, 0], color="#4caf50", linewidth=5)
+    ax.plot([mx - sec.side_wall_length_x/2, mx + sec.side_wall_length_x/2], [inp.plan_y, inp.plan_y], color="#4caf50", linewidth=5)
+    ax.plot([0, 0], [my - sec.side_wall_length_y/2, my + sec.side_wall_length_y/2], color="#4caf50", linewidth=5)
+    ax.plot([inp.plan_x, inp.plan_x], [my - sec.side_wall_length_y/2, my + sec.side_wall_length_y/2], color="#4caf50", linewidth=5)
 
-    # outriggers
-    if sec.story in inp.outrigger_story_levels and inp.outrigger_system != OutriggerSystem.NONE:
-        mx, my = inp.plan_x/2, inp.plan_y/2
+    zone_stories = [s.story for s in res.sections if s.zone == sec.zone]
+    outriggers_in_zone = [lev for lev in inp.outrigger_story_levels if lev in zone_stories]
+
+    if inp.outrigger_system != OutriggerSystem.NONE and outriggers_in_zone:
+        # perimeter belt / collector
+        ax.plot([0, inp.plan_x, inp.plan_x, 0, 0], [0, 0, inp.plan_y, inp.plan_y, 0],
+                color="#ff6b00", linewidth=3.0, alpha=0.75)
+
+        # Main outrigger arms from core to perimeter columns
         ax.plot([0, cx0], [my, my], color="#ff6b00", linewidth=5)
-        ax.plot([cx0 + sec.core_x, inp.plan_x], [my, my], color="#ff6b00", linewidth=5)
+        ax.plot([cx1, inp.plan_x], [my, my], color="#ff6b00", linewidth=5)
         ax.plot([mx, mx], [0, cy0], color="#ff6b00", linewidth=5)
-        ax.plot([mx, mx], [cy0 + sec.core_y, inp.plan_y], color="#ff6b00", linewidth=5)
+        ax.plot([mx, mx], [cy1, inp.plan_y], color="#ff6b00", linewidth=5)
 
-    ax.set_title(f"Plan view - {zone_choice} | Story {sec.story}")
+        # Diagonal tubular bracing in the braced bays, shown in plan as dashed load paths
+        for y in np.linspace(my - sec.core_y/2, my + sec.core_y/2, max(inp.braced_spans_x, 1)):
+            ax.plot([0, cx0], [y - inp.outrigger_depth_m/2, my], color="#b34700", linewidth=2.4, linestyle="--")
+            ax.plot([0, cx0], [y + inp.outrigger_depth_m/2, my], color="#b34700", linewidth=2.4, linestyle="--")
+            ax.plot([inp.plan_x, cx1], [y - inp.outrigger_depth_m/2, my], color="#b34700", linewidth=2.4, linestyle="--")
+            ax.plot([inp.plan_x, cx1], [y + inp.outrigger_depth_m/2, my], color="#b34700", linewidth=2.4, linestyle="--")
+
+        for x in np.linspace(mx - sec.core_x/2, mx + sec.core_x/2, max(inp.braced_spans_y, 1)):
+            ax.plot([x - inp.outrigger_depth_m/2, mx], [0, cy0], color="#b34700", linewidth=2.4, linestyle="--")
+            ax.plot([x + inp.outrigger_depth_m/2, mx], [0, cy0], color="#b34700", linewidth=2.4, linestyle="--")
+            ax.plot([x - inp.outrigger_depth_m/2, mx], [inp.plan_y, cy1], color="#b34700", linewidth=2.4, linestyle="--")
+            ax.plot([x + inp.outrigger_depth_m/2, mx], [inp.plan_y, cy1], color="#b34700", linewidth=2.4, linestyle="--")
+
+        ax.text(inp.plan_x + 2, inp.plan_y * 0.50,
+                f"OUTRIGGER LOAD PATH\nStories: {outriggers_in_zone}\n{inp.outrigger_system.value}\nBraced spans X/Y: {inp.braced_spans_x}/{inp.braced_spans_y}",
+                fontsize=9, color="#b34700", fontweight="bold", va="center")
+    else:
+        ax.text(inp.plan_x + 2, inp.plan_y * 0.50,
+                f"No outrigger in this displayed zone\nOutrigger stories: {list(inp.outrigger_story_levels)}",
+                fontsize=9, color="#666666", va="center")
+
+    ax.set_title(f"Plan view - {zone_choice} | Core + perimeter belt + tubular outrigger load path")
     ax.set_aspect("equal")
-    ax.set_xlim(-5, inp.plan_x + 25)
+    ax.set_xlim(-5, inp.plan_x + 35)
     ax.set_ylim(inp.plan_y + 5, -5)
-    ax.text(inp.plan_x + 3, 3, f"Core: {sec.core_x:.2f} x {sec.core_y:.2f} m\nWall t: {sec.core_wall_t:.2f} m\nBeam: {sec.beam_b:.2f} x {sec.beam_h:.2f} m\nSlab: {sec.slab_t:.2f} m", va="top", fontsize=9)
+    ax.text(inp.plan_x + 2, 3,
+            f"Core: {sec.core_x:.2f} x {sec.core_y:.2f} m\nWall t: {sec.core_wall_t:.2f} m\nBeam: {sec.beam_b:.2f} x {sec.beam_h:.2f} m\nSlab: {sec.slab_t:.2f} m",
+            va="top", fontsize=9)
     return fig
-
 
 def plot_modes(res: DesignResult, direction: Direction):
     modal = res.modal_x if direction == Direction.X else res.modal_y
@@ -1391,22 +1434,44 @@ def plot_iteration(res: DesignResult):
     df = res.iteration_table
     if df.empty:
         return None
+
+    tx_col = "T1 X (s)" if "T1 X (s)" in df.columns else "T_modal X (s)"
+    ty_col = "T1 Y (s)" if "T1 Y (s)" in df.columns else "T_modal Y (s)"
+    conc_col = "Concrete (m³)" if "Concrete (m³)" in df.columns else None
+
     fig, axes = plt.subplots(2, 2, figsize=(12, 9))
-    axes[0,0].plot(df["Iteration"], df["Max drift X"], marker="o", label="X")
-    axes[0,0].plot(df["Iteration"], df["Max drift Y"], marker="s", label="Y")
-    axes[0,0].plot(df["Iteration"], df["Drift limit"], linestyle="--", label="Limit")
-    axes[0,0].set_title("Drift convergence"); axes[0,0].grid(True, alpha=0.3); axes[0,0].legend()
-    axes[0,1].plot(df["Iteration"], df["T1 X (s)"], marker="o", label="T1 X")
-    axes[0,1].plot(df["Iteration"], df["T1 Y (s)"], marker="s", label="T1 Y")
-    axes[0,1].set_title("Period evolution"); axes[0,1].grid(True, alpha=0.3); axes[0,1].legend()
-    axes[1,0].plot(df["Iteration"], df["Core wall base t (m)"], marker="o", label="Core wall t")
-    axes[1,0].plot(df["Iteration"], df["Interior column base X (m)"], marker="s", label="Column")
-    axes[1,0].set_title("Member size evolution"); axes[1,0].grid(True, alpha=0.3); axes[1,0].legend()
-    axes[1,1].plot(df["Iteration"], df["Concrete (m³)"], marker="d")
-    axes[1,1].set_title("Concrete quantity"); axes[1,1].grid(True, alpha=0.3)
+
+    axes[0, 0].plot(df["Iteration"], df["Max drift X"], marker="o", label="X")
+    axes[0, 0].plot(df["Iteration"], df["Max drift Y"], marker="s", label="Y")
+    axes[0, 0].plot(df["Iteration"], df["Drift limit"], linestyle="--", label="Limit")
+    axes[0, 0].set_title("Drift convergence")
+    axes[0, 0].grid(True, alpha=0.3)
+    axes[0, 0].legend()
+
+    axes[0, 1].plot(df["Iteration"], df[tx_col], marker="o", label="T modal X")
+    axes[0, 1].plot(df["Iteration"], df[ty_col], marker="s", label="T modal Y")
+    if "CuTa (s)" in df.columns:
+        axes[0, 1].plot(df["Iteration"], df["CuTa (s)"], linestyle="--", label="ASCE CuTa cap")
+    axes[0, 1].set_title("Period evolution")
+    axes[0, 1].grid(True, alpha=0.3)
+    axes[0, 1].legend()
+
+    axes[1, 0].plot(df["Iteration"], df["Core wall base t (m)"], marker="o", label="Core wall t")
+    axes[1, 0].plot(df["Iteration"], df["Interior column base X (m)"], marker="s", label="Column")
+    axes[1, 0].set_title("Member size evolution")
+    axes[1, 0].grid(True, alpha=0.3)
+    axes[1, 0].legend()
+
+    if conc_col:
+        axes[1, 1].plot(df["Iteration"], df[conc_col], marker="d")
+        axes[1, 1].set_title("Concrete quantity")
+    else:
+        axes[1, 1].text(0.5, 0.5, "No quantity column", ha="center", va="center")
+        axes[1, 1].set_title("Quantity")
+    axes[1, 1].grid(True, alpha=0.3)
+
     fig.tight_layout()
     return fig
-
 
 def spectrum_table(inp: BuildingInput) -> pd.DataFrame:
     T = np.linspace(0, max(10.0, inp.asce7.TL * 1.25), 150)
@@ -1944,7 +2009,7 @@ def main():
     st.caption(APP_VERSION)
     st.info(
         "This version keeps a rich interface but uses a flexural MDOF solver with displacement and rotation DOFs. "
-        "Periods are computed, not targeted. Redesign is controlled by ASCE ELF/RSA consistency, modal mass, and drift."
+        "Periods are computed, not targeted. Outrigger load path is shown in plan and included as steel rotational restraint."
     )
 
     if "v13_result" not in st.session_state:
