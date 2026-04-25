@@ -4,6 +4,8 @@
 👉 https://tallbuildingv4outriggerapp-c2gaoqfca7di6woww8pvod.streamlit.app/
 **Author:** BENYAMIN RAZAZIYAN  
 **Version:** 4.4  
+https://doi.org/10.5281/zenodo.19767248
+
 **Project type:** Preliminary computational framework for tall-building lateral-system comparison  
 **Main scope:** Core wall, perimeter/side walls, basement retaining-wall contribution, braced-bay outrigger stiffness, modal analysis, response-spectrum analysis, drift check, and preliminary member sizing.
 
