@@ -16,7 +16,7 @@ Core features
 - Perimeter walls are drawn and included in the lateral stiffness model.
 - Optional below-grade retaining-wall stiffness contribution for basement levels.
 
-Author: Benyamin Rezaziyan
+Author: Benyamin Rezazian
 Version: 4.1
 """
 
@@ -36,7 +36,7 @@ except Exception:
     scipy_eigh = None
 
 
-APP_VERSION = "4.2"
+APP_VERSION = "4.3-spectrum-input-fixed"
 PROJECT_TITLE = "Tall Building Outrigger Predesign Framework"
 AUTHOR_NAME = "Benyamin Rezazian"
 G = 9.81
@@ -72,7 +72,11 @@ class OutriggerSystem(str, Enum):
 class ASCE7Params:
     SDS: float = 0.70
     SD1: float = 0.35
+    SS: float = 1.00
     S1: float = 0.30
+    Fa: float = 1.00
+    Fv: float = 1.00
+    use_site_coefficients: bool = False
     TL: float = 8.0
     R: float = 5.0
     Ie: float = 1.0
@@ -1191,21 +1195,29 @@ def solve_modal(inp: BuildingInput, props: List[StoryProperties], direction: Dir
 # 6. ASCE 7 RESPONSE SPECTRUM
 # ============================================================
 
+def resolve_asce_design_spectrum(asce: ASCE7Params) -> Tuple[float, float]:
+    """Return effective ASCE design spectrum values SDS and SD1."""
+    if asce.use_site_coefficients:
+        return max((2.0 / 3.0) * asce.Fa * asce.SS, 1e-9), max((2.0 / 3.0) * asce.Fv * asce.S1, 1e-9)
+    return max(asce.SDS, 1e-9), max(asce.SD1, 1e-9)
+
 def asce_corner_periods(asce: ASCE7Params) -> Tuple[float, float]:
-    Ts = asce.SD1 / max(asce.SDS, 1e-9)
+    SDS_eff, SD1_eff = resolve_asce_design_spectrum(asce)
+    Ts = SD1_eff / max(SDS_eff, 1e-9)
     return 0.2 * Ts, Ts
 
 
 def asce_spectrum_sa_g(T: float, asce: ASCE7Params) -> float:
     T = max(float(T), 1e-9)
+    SDS_eff, SD1_eff = resolve_asce_design_spectrum(asce)
     T0, Ts = asce_corner_periods(asce)
     if T < T0 and T0 > 0:
-        return asce.SDS * (0.4 + 0.6 * T / T0)
+        return SDS_eff * (0.4 + 0.6 * T / T0)
     if T <= Ts:
-        return asce.SDS
+        return SDS_eff
     if T <= asce.TL:
-        return asce.SD1 / T
-    return asce.SD1 * asce.TL / (T**2)
+        return SD1_eff / T
+    return SD1_eff * asce.TL / (T**2)
 
 
 def rsa_force_sa_g(T: float, asce: ASCE7Params) -> float:
@@ -1219,14 +1231,15 @@ def approximate_Ta(inp: BuildingInput) -> float:
 
 def asce_Cs(T: float, asce: ASCE7Params) -> float:
     T = max(float(T), 1e-6)
+    SDS_eff, SD1_eff = resolve_asce_design_spectrum(asce)
     R_over_Ie = asce.R / asce.Ie
-    Cs_short = asce.SDS / R_over_Ie
+    Cs_short = SDS_eff / R_over_Ie
     if T <= asce.TL:
-        Cs_long = asce.SD1 / (T * R_over_Ie)
+        Cs_long = SD1_eff / (T * R_over_Ie)
     else:
-        Cs_long = asce.SD1 * asce.TL / (T**2 * R_over_Ie)
+        Cs_long = SD1_eff * asce.TL / (T**2 * R_over_Ie)
     Cs = min(Cs_short, Cs_long)
-    Cs_min = max(0.044 * asce.SDS * asce.Ie, 0.01)
+    Cs_min = max(0.044 * SDS_eff * asce.Ie, 0.01)
     if asce.S1 >= 0.6:
         Cs_min = max(Cs_min, 0.5 * asce.S1 / R_over_Ie)
     return max(Cs, Cs_min)
@@ -1294,7 +1307,7 @@ def response_spectrum_analysis(inp: BuildingInput, props: List[StoryProperties],
         if inp.use_asce7_rsa:
             Sa = rsa_force_sa_g(T, inp.asce7) * G
         else:
-            Sa = inp.asce7.SDS * G * inp.asce7.Ie / inp.asce7.R
+            Sa = resolve_asce_design_spectrum(inp.asce7)[0] * G * inp.asce7.Ie / inp.asce7.R
 
         u = phi_u * gamma * Sa / omega**2
         f = masses * phi_u * gamma * Sa
@@ -2300,9 +2313,23 @@ def streamlit_input_panel() -> BuildingInput:
     c13, c14 = st.columns(2)
     with c13:
         use_asce7_rsa = st.checkbox("Use ASCE 7 RSA", True)
-        SDS = st.number_input("SDS (g)", 0.01, 3.0, 0.70)
-        SD1 = st.number_input("SD1 (g)", 0.01, 3.0, 0.35)
-        S1 = st.number_input("S1 (g)", 0.0, 3.0, 0.30)
+        spectrum_input_mode = st.selectbox("Spectrum input mode", ["Direct design values: SDS and SD1", "Mapped/site values: SS, S1, Fa, Fv"], index=0)
+        use_site_coefficients = spectrum_input_mode.startswith("Mapped")
+        if use_site_coefficients:
+            SS = st.number_input("SS mapped spectral acceleration (g)", 0.01, 5.0, 1.00)
+            S1 = st.number_input("S1 mapped spectral acceleration (g)", 0.0, 3.0, 0.30)
+            Fa = st.number_input("Fa site coefficient", 0.10, 5.0, 1.00)
+            Fv = st.number_input("Fv site coefficient", 0.10, 5.0, 1.00)
+            SDS = (2.0 / 3.0) * Fa * SS
+            SD1 = (2.0 / 3.0) * Fv * S1
+            st.caption(f"Computed: SDS={SDS:.3f} g, SD1={SD1:.3f} g")
+        else:
+            SDS = st.number_input("SDS design spectral acceleration (g)", 0.01, 3.0, 0.70)
+            SD1 = st.number_input("SD1 design spectral acceleration (g)", 0.01, 3.0, 0.35)
+            SS = st.number_input("SS mapped value for report only (g)", 0.01, 5.0, 1.00)
+            S1 = st.number_input("S1 mapped value for Cs minimum check (g)", 0.0, 3.0, 0.30)
+            Fa = 1.0
+            Fv = 1.0
         TL = st.number_input("TL (s)", 2.0, 20.0, 8.0)
         R = st.number_input("R", 1.0, 12.0, 5.0)
         Ie = st.number_input("Ie", 0.5, 2.0, 1.0)
@@ -2407,8 +2434,9 @@ def streamlit_input_panel() -> BuildingInput:
         combination=CombinationMethod(combination),
         use_asce7_rsa=bool(use_asce7_rsa),
         asce7=ASCE7Params(
-            SDS=float(SDS), SD1=float(SD1), S1=float(S1), TL=float(TL),
-            R=float(R), Ie=float(Ie), Cd=float(Cd), damping_ratio=float(damping_ratio),
+            SDS=float(SDS), SD1=float(SD1), SS=float(SS), S1=float(S1),
+            Fa=float(Fa), Fv=float(Fv), use_site_coefficients=bool(use_site_coefficients),
+            TL=float(TL), R=float(R), Ie=float(Ie), Cd=float(Cd), damping_ratio=float(damping_ratio),
             Ct=float(Ct), x_exp=float(x_exp), Cu=float(Cu),
             rsa_min_ratio_to_elf=float(rsa_min_ratio_to_elf),
         ),
