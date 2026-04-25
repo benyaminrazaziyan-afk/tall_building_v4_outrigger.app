@@ -1,5 +1,5 @@
 """
-Tall Building Outrigger Predesign Framework - Version 4.1
+Tall Building Outrigger Predesign Framework - Version 4.2
 =========================================================
 
 A preliminary structural engineering tool for comparing tall-building lateral
@@ -36,7 +36,7 @@ except Exception:
     scipy_eigh = None
 
 
-APP_VERSION = "4.1"
+APP_VERSION = "4.2"
 PROJECT_TITLE = "Tall Building Outrigger Predesign Framework"
 AUTHOR_NAME = "Benyamin Rezazian"
 G = 9.81
@@ -134,6 +134,10 @@ class BuildingInput:
     min_beam_depth: float = 0.75
     min_slab_thickness: float = 0.22
     max_slab_thickness: float = 0.45
+
+    # Material-responsive preliminary sizing reference values
+    reference_fck: float = 70.0
+    reference_Ec: float = 36000.0
 
     # Effective stiffness factors
     wall_cracked_factor: float = 0.35
@@ -379,6 +383,40 @@ def initial_core_dimensions(inp: BuildingInput) -> Tuple[float, float, float, fl
     return core_x, core_y, opening_x, opening_y
 
 
+
+def material_size_factor(inp: BuildingInput, member: str) -> float:
+    """Material-responsive size modifier for preliminary RC member dimensions."""
+    fck = max(float(inp.fck), 12.0)
+    Ec = max(float(inp.Ec), 12000.0)
+    fck_ref = max(float(inp.reference_fck), 12.0)
+    Ec_ref = max(float(inp.reference_Ec), 12000.0)
+    member = member.lower().strip()
+    exponents = {
+        "column": (0.45, 0.10, 0.72, 1.35),
+        "wall":   (0.28, 0.22, 0.76, 1.30),
+        "beam":   (0.20, 0.10, 0.82, 1.22),
+        "slab":   (0.14, 0.06, 0.88, 1.15),
+    }
+    a_fck, a_ec, lower, upper = exponents.get(member, exponents["column"])
+    factor = (fck_ref / fck) ** a_fck * (Ec_ref / Ec) ** a_ec
+    return float(np.clip(factor, lower, upper))
+
+
+def material_diagnostics(inp: BuildingInput) -> pd.DataFrame:
+    """Table of active fck/Ec modifiers used in member sizing."""
+    return pd.DataFrame([
+        {
+            "Member": m,
+            "fck (MPa)": inp.fck,
+            "Ec (MPa)": inp.Ec,
+            "Reference fck (MPa)": inp.reference_fck,
+            "Reference Ec (MPa)": inp.reference_Ec,
+            "Size modifier": material_size_factor(inp, m),
+        }
+        for m in ["column", "wall", "beam", "slab"]
+    ])
+
+
 def wall_thickness(inp: BuildingInput, story: int, scale: float = 1.0) -> float:
     """
     Monotonic wall thickness by height.
@@ -386,7 +424,7 @@ def wall_thickness(inp: BuildingInput, story: int, scale: float = 1.0) -> float:
     """
     h_ratio = 1.0 - (story - 1) / max(inp.n_story - 1, 1)
     base = inp.height / 220.0
-    t = base * (0.55 + 0.45 * h_ratio) * scale * inp.design_wall_scale
+    t = base * (0.55 + 0.45 * h_ratio) * material_size_factor(inp, "wall") * scale * inp.design_wall_scale
     return float(np.clip(t, inp.min_wall_thickness, inp.max_wall_thickness))
 
 
@@ -404,7 +442,7 @@ def slab_thickness(inp: BuildingInput, story: int, scale: float = 1.0) -> float:
     h_ratio = 1.0 - (story - 1) / max(inp.n_story - 1, 1)
     zone_factor = 1.00 + 0.08 * h_ratio
     out_factor = 1.10 if story in active_outrigger_levels(inp) and inp.outrigger_system != OutriggerSystem.NONE else 1.00
-    t = span / 32.0 * zone_factor * out_factor * scale * inp.design_slab_scale
+    t = span / 32.0 * zone_factor * out_factor * material_size_factor(inp, "slab") * scale * inp.design_slab_scale
     return float(np.clip(t, inp.min_slab_thickness, inp.max_slab_thickness))
 
 
@@ -422,7 +460,7 @@ def beam_size(inp: BuildingInput, story: int, scale: float = 1.0) -> Tuple[float
     # collector beams at outrigger floors must be stronger
     out_factor = 1.35 if story in active_outrigger_levels(inp) and inp.outrigger_system != OutriggerSystem.NONE else 1.00
 
-    h = base_h * zone_factor * out_factor * scale * inp.design_beam_scale
+    h = base_h * zone_factor * out_factor * material_size_factor(inp, "beam") * scale * inp.design_beam_scale
     h = float(np.clip(h, inp.min_beam_depth, 2.80))
     b = float(np.clip(0.45 * h, inp.min_beam_width, 1.30))
     return b, h
@@ -467,7 +505,7 @@ def column_size(inp: BuildingInput, story: int, slab_t: float, scale: float = 1.
     h_ratio = 1.0 - (story - 1) / max(inp.n_story - 1, 1)
     tower_factor = 0.85 + 0.35 * h_ratio
 
-    dim = gravity_dim * tower_factor * scale * inp.design_column_scale
+    dim = gravity_dim * tower_factor * material_size_factor(inp, "column") * scale * inp.design_column_scale
     dim = float(np.clip(dim, inp.min_column_dim, inp.max_column_dim))
 
     interior = directional_column_dims(dim, inp)
@@ -1909,7 +1947,12 @@ def build_report(res: DesignResult) -> str:
     lines.append("-" * 96)
     lines.append(summary_table(res).to_string(index=False))
     lines.append("")
-    lines.append("3. Final dimensions")
+    lines.append("3. Material effect modifiers")
+    lines.append("-" * 96)
+    lines.append(material_diagnostics(res.input).to_string(index=False))
+    lines.append("")
+
+    lines.append("4. Final dimensions")
     lines.append("-" * 96)
     lines.append(final_dimensions_table(res).to_string(index=False))
     lines.append("")
@@ -2459,6 +2502,7 @@ def main():
                 "OUTRIGGER EFFECT",
                 "OUTRIGGER DESIGN",
                 "DESIGN CHECKS",
+                "MATERIAL EFFECT",
                 "Summary",
                 "Final dimensions",
                 "Plan",
@@ -2501,23 +2545,28 @@ def main():
             st.dataframe(design_check_table(res), use_container_width=True, hide_index=True)
 
         with tabs[5]:
-            st.dataframe(summary_table(res), use_container_width=True, hide_index=True)
+            st.markdown("### Material modifiers used in member sizing")
+            st.dataframe(material_diagnostics(res.input), use_container_width=True, hide_index=True)
+            st.caption("Higher fck/Ec reduces preliminary member dimensions until minimum/detailing limits or drift redesign govern.")
 
         with tabs[6]:
-            st.dataframe(final_dimensions_table(res), use_container_width=True, hide_index=True)
+            st.dataframe(summary_table(res), use_container_width=True, hide_index=True)
 
         with tabs[7]:
-            st.pyplot(plot_plan(res, zone_name), use_container_width=True)
+            st.dataframe(final_dimensions_table(res), use_container_width=True, hide_index=True)
 
         with tabs[8]:
+            st.pyplot(plot_plan(res, zone_name), use_container_width=True)
+
+        with tabs[9]:
             st.pyplot(plot_modes(res, Direction.X), use_container_width=True)
             st.dataframe(modal_table(res.modal_x), use_container_width=True, hide_index=True)
 
-        with tabs[9]:
+        with tabs[10]:
             st.pyplot(plot_modes(res, Direction.Y), use_container_width=True)
             st.dataframe(modal_table(res.modal_y), use_container_width=True, hide_index=True)
 
-        with tabs[10]:
+        with tabs[11]:
             p1, p2 = st.columns(2)
             with p1:
                 st.pyplot(plot_story_response(res, Direction.X, "Story shear"), use_container_width=True)
@@ -2525,7 +2574,7 @@ def main():
                 st.pyplot(plot_story_response(res, Direction.X, "Drift ratio"), use_container_width=True)
             st.dataframe(story_response_table(res, Direction.X), use_container_width=True, hide_index=True)
 
-        with tabs[11]:
+        with tabs[12]:
             p1, p2 = st.columns(2)
             with p1:
                 st.pyplot(plot_story_response(res, Direction.Y, "Story shear"), use_container_width=True)
@@ -2533,27 +2582,27 @@ def main():
                 st.pyplot(plot_story_response(res, Direction.Y, "Drift ratio"), use_container_width=True)
             st.dataframe(story_response_table(res, Direction.Y), use_container_width=True, hide_index=True)
 
-        with tabs[12]:
+        with tabs[13]:
             st.pyplot(plot_stiffness(res), use_container_width=True)
             st.dataframe(stiffness_table(res), use_container_width=True, hide_index=True)
 
-        with tabs[13]:
+        with tabs[14]:
             st.pyplot(plot_spectrum(res.input), use_container_width=True)
             st.dataframe(spectrum_table(res.input), use_container_width=True, hide_index=True)
 
-        with tabs[14]:
+        with tabs[15]:
             fig = plot_iteration(res)
             if fig is not None:
                 st.pyplot(fig, use_container_width=True)
             st.dataframe(res.iteration_table, use_container_width=True, hide_index=True)
 
-        with tabs[15]:
+        with tabs[16]:
             st.markdown("### Story sections")
             st.dataframe(pd.DataFrame([s.__dict__ for s in res.sections]), use_container_width=True, hide_index=True)
             st.markdown("### Story properties")
             st.dataframe(pd.DataFrame([p.__dict__ for p in res.properties]), use_container_width=True, hide_index=True)
 
-        with tabs[16]:
+        with tabs[17]:
             st.text_area("Report", st.session_state.v4_report, height=600)
 
 
