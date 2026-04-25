@@ -17,7 +17,7 @@ Core features
 - Optional below-grade retaining-wall stiffness contribution for basement levels.
 
 Author: BENYAMIN RAZAZIYAN
-Version: 4.1
+Version: 4.4
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ except Exception:
     scipy_eigh = None
 
 
-APP_VERSION = "4.4-reviewed-engineering-patch"
+APP_VERSION = "4.4-real-design-period-drift-controlled"
 PROJECT_TITLE = "Tall Building Outrigger Predesign Framework"
 AUTHOR_NAME = "BENYAMIN RAZAZIYAN"
 G = 9.81
@@ -131,22 +131,22 @@ class BuildingInput:
 
     # Preliminary section limits
     min_wall_thickness: float = 0.30
-    max_wall_thickness: float = 1.50
+    max_wall_thickness: float = 2.20
     min_column_dim: float = 0.70
-    max_column_dim: float = 2.50
+    max_column_dim: float = 3.50
     min_beam_width: float = 0.40
     min_beam_depth: float = 0.75
     min_slab_thickness: float = 0.22
-    max_slab_thickness: float = 0.45
+    max_slab_thickness: float = 0.60
 
     # Material-responsive preliminary sizing reference values
     reference_fck: float = 70.0
     reference_Ec: float = 36000.0
 
     # Effective stiffness factors
-    wall_cracked_factor: float = 0.35
-    column_cracked_factor: float = 0.70
-    side_wall_cracked_factor: float = 0.35
+    wall_cracked_factor: float = 0.20
+    column_cracked_factor: float = 0.35
+    side_wall_cracked_factor: float = 0.15
     coupling_factor: float = 1.00
 
     # Wall/column layout
@@ -189,12 +189,21 @@ class BuildingInput:
     # Engineering calibration factors for preliminary stick models.
     # The full diagonal EA/L is not allowed to act as a direct floor-to-ground lateral spring.
     # It is first reduced for connection, floor diaphragm, collector, brace-panel, and column-line flexibility.
-    outrigger_effectiveness_factor: float = 0.25
-    outrigger_lateral_participation: float = 0.05
+    outrigger_effectiveness_factor: float = 0.10
+    outrigger_lateral_participation: float = 0.00
 
     # Criteria
     drift_limit_ratio: float = 0.015
     minimum_modal_mass_ratio: float = 0.90
+
+    # Period-controlled real design criteria
+    enforce_period_limit: bool = True
+    period_limit_multiplier: float = 1.00
+    target_period_utilization: float = 0.95
+    model_uncertainty_period_factor: float = 1.35
+    strengthen_core_for_period: bool = True
+    strengthen_columns_for_period: bool = True
+    strengthen_outrigger_for_period: bool = True
 
     # Solver
     n_modes: int = 12
@@ -204,8 +213,8 @@ class BuildingInput:
 
     # Redesign
     auto_redesign: bool = True
-    max_iterations: int = 12
-    growth_limit_per_iteration: float = 1.12
+    max_iterations: int = 18
+    growth_limit_per_iteration: float = 1.18
     reduction_limit_per_iteration: float = 0.96
     allow_section_reduction: bool = False
 
@@ -1276,6 +1285,26 @@ def elf_base_shear(inp: BuildingInput, modal_T: float, total_mass_kg: float) -> 
     return V_kN, Cs, Ta, T_used
 
 
+
+def period_limit_values(inp: BuildingInput, modal_T: float) -> Tuple[float, float, float, float]:
+    """Return Ta, CuTa, allowable period, and design period for redesign checks."""
+    Ta = approximate_Ta(inp)
+    CuTa = inp.asce7.Cu * Ta
+    T_allow = inp.period_limit_multiplier * CuTa
+    T_design = modal_T * max(inp.model_uncertainty_period_factor, 1.0)
+    return Ta, CuTa, T_allow, T_design
+
+
+def period_redesign_ratio(inp: BuildingInput, res: DesignResult) -> Tuple[float, float, float, float, float]:
+    tx = res.modal_x.periods_s[0]
+    ty = res.modal_y.periods_s[0]
+    Ta, CuTa, T_allow_x, T_design_x = period_limit_values(inp, tx)
+    _, _, T_allow_y, T_design_y = period_limit_values(inp, ty)
+    ratio_x = T_design_x / max(T_allow_x, 1e-9)
+    ratio_y = T_design_y / max(T_allow_y, 1e-9)
+    return max(ratio_x, ratio_y), T_design_x, T_design_y, T_allow_x, CuTa
+
+
 def cqc_rho(wi: float, wj: float, zeta: float) -> float:
     if abs(wi - wj) < 1e-12:
         return 1.0
@@ -1435,14 +1464,12 @@ def evaluate(inp: BuildingInput, wall_scale: float = 1.0, col_scale: float = 1.0
 
 def run_design(inp: BuildingInput) -> DesignResult:
     """
-    ASCE-compliant preliminary redesign logic.
+    Real preliminary design loop.
 
-    Corrected in v17:
-      - period is computed, not targeted,
-      - drift controls stiffness redesign,
-      - columns/walls are monotonic by height,
-      - beams/slabs change by zone and outrigger collector demand,
-      - outrigger tube stiffness and collector beams are redesigned together.
+    The code now designs the proposed sections against two independent checks:
+    drift and ASCE upper-bound period. If the analytical design period is larger
+    than CuTa, the code increases wall, column, beam/slab collector, and outrigger
+    scales and rebuilds the stiffness matrix. This is not artificial ETABS matching.
     """
     if not inp.auto_redesign:
         return evaluate(inp)
@@ -1466,72 +1493,69 @@ def run_design(inp: BuildingInput) -> DesignResult:
             design_slab_scale=slab_scale,
             design_outrigger_scale=out_scale,
         )
-
         res = evaluate(current_inp, 1.0, 1.0, 1.0)
 
         max_drift_x = float(np.max(res.rsa_x.drift_ratio))
         max_drift_y = float(np.max(res.rsa_y.drift_ratio))
         max_drift = max(max_drift_x, max_drift_y)
+        drift_ratio_over = max_drift / max(inp.drift_limit_ratio, 1e-12)
+
+        period_ratio, T_design_x, T_design_y, T_allow, CuTa = period_redesign_ratio(current_inp, res)
+        target_period_ratio = period_ratio / max(inp.target_period_utilization, 1e-9)
 
         mass_x = res.modal_x.cumulative_mass_ratios[-1] if res.modal_x.cumulative_mass_ratios else 0.0
         mass_y = res.modal_y.cumulative_mass_ratios[-1] if res.modal_y.cumulative_mass_ratios else 0.0
         min_mass = min(mass_x, mass_y)
-
         total_concrete = sum(p.concrete_m3 for p in res.properties)
         total_steel = sum(p.steel_kg for p in res.properties)
 
-        drift_ratio_over = max_drift / max(inp.drift_limit_ratio, 1e-12)
         drift_excess = max(drift_ratio_over - 1.0, 0.0)
-        drift_too_low = max(0.35 - drift_ratio_over, 0.0)
+        period_excess = max(period_ratio - 1.0, 0.0) if inp.enforce_period_limit else 0.0
         modal_mass_deficit = max(inp.minimum_modal_mass_ratio - min_mass, 0.0)
+        score = 3500.0 * period_excess**2 + 2000.0 * drift_excess**2 + 300.0 * modal_mass_deficit**2 + 1e-6 * total_concrete + 2e-7 * total_steel
 
-        score = (
-            2000.0 * drift_excess**2
-            + 300.0 * modal_mass_deficit**2
-            + 20.0 * drift_too_low**2
-            + 0.0000010 * total_concrete
-            + 0.0000002 * total_steel
-        )
-
-        logs.append(
-            {
-                "Iteration": it,
-                "Wall scale": wall_scale,
-                "Column scale": col_scale,
-                "Beam scale": beam_scale,
-                "Slab scale": slab_scale,
-                "Outrigger scale": out_scale,
-                "Wall cracked factor": current_inp.wall_cracked_factor,
-                "Column cracked factor": current_inp.column_cracked_factor,
-                "Side wall cracked factor": current_inp.side_wall_cracked_factor,
-                "Outrigger effectiveness": current_inp.outrigger_effectiveness_factor,
-                "Outrigger lateral participation": current_inp.outrigger_lateral_participation,
-                "T_modal X (s)": res.modal_x.periods_s[0],
-                "T_modal Y (s)": res.modal_y.periods_s[0],
-                "Ta X/Y reference (s)": res.rsa_x.Ta_s,
-                "CuTa (s)": inp.asce7.Cu * res.rsa_x.Ta_s,
-                "T_used ELF X (s)": res.rsa_x.T_used_s,
-                "T_used ELF Y (s)": res.rsa_y.T_used_s,
-                "Mass X (%)": 100 * mass_x,
-                "Mass Y (%)": 100 * mass_y,
-                "Max drift X": max_drift_x,
-                "Max drift Y": max_drift_y,
-                "Drift limit": inp.drift_limit_ratio,
-                "RSA scale X": res.rsa_x.rsa_scale_factor,
-                "RSA scale Y": res.rsa_y.rsa_scale_factor,
-                "ELF base shear X (kN)": res.rsa_x.elf_base_shear_kN,
-                "ELF base shear Y (kN)": res.rsa_y.elf_base_shear_kN,
-                "Scaled RSA base shear X (kN)": res.rsa_x.base_shear_scaled_kN,
-                "Scaled RSA base shear Y (kN)": res.rsa_y.base_shear_scaled_kN,
-                "Concrete (m³)": total_concrete,
-                "Steel (kg)": total_steel,
-                "Core wall base t (m)": res.sections[0].core_wall_t,
-                "Interior column base X (m)": res.sections[0].column_interior_x,
-                "Beam b (m)": res.sections[0].beam_b,
-                "Beam h (m)": res.sections[0].beam_h,
-                "Slab t (m)": res.sections[0].slab_t,
-            }
-        )
+        logs.append({
+            "Iteration": it,
+            "Wall scale": wall_scale,
+            "Column scale": col_scale,
+            "Beam scale": beam_scale,
+            "Slab scale": slab_scale,
+            "Outrigger scale": out_scale,
+            "Wall cracked factor": current_inp.wall_cracked_factor,
+            "Column cracked factor": current_inp.column_cracked_factor,
+            "Side wall cracked factor": current_inp.side_wall_cracked_factor,
+            "Outrigger effectiveness": current_inp.outrigger_effectiveness_factor,
+            "Outrigger lateral participation": current_inp.outrigger_lateral_participation,
+            "T_modal X (s)": res.modal_x.periods_s[0],
+            "T_modal Y (s)": res.modal_y.periods_s[0],
+            "T_design X = T*uncertainty (s)": T_design_x,
+            "T_design Y = T*uncertainty (s)": T_design_y,
+            "Ta reference (s)": res.rsa_x.Ta_s,
+            "CuTa (s)": CuTa,
+            "T_allow = factor*CuTa (s)": T_allow,
+            "Period demand/cap": period_ratio,
+            "Max drift X": max_drift_x,
+            "Max drift Y": max_drift_y,
+            "Drift demand/limit": drift_ratio_over,
+            "Drift limit": inp.drift_limit_ratio,
+            "Mass X (%)": 100 * mass_x,
+            "Mass Y (%)": 100 * mass_y,
+            "RSA scale X": res.rsa_x.rsa_scale_factor,
+            "RSA scale Y": res.rsa_y.rsa_scale_factor,
+            "ELF base shear X (kN)": res.rsa_x.elf_base_shear_kN,
+            "ELF base shear Y (kN)": res.rsa_y.elf_base_shear_kN,
+            "Scaled RSA base shear X (kN)": res.rsa_x.base_shear_scaled_kN,
+            "Scaled RSA base shear Y (kN)": res.rsa_y.base_shear_scaled_kN,
+            "Concrete (m³)": total_concrete,
+            "Steel (kg)": total_steel,
+            "Core wall base t (m)": res.sections[0].core_wall_t,
+            "Interior column base X (m)": res.sections[0].column_interior_x,
+            "Perimeter column base X (m)": res.sections[0].column_perimeter_x,
+            "Corner column base X (m)": res.sections[0].column_corner_x,
+            "Beam b (m)": res.sections[0].beam_b,
+            "Beam h (m)": res.sections[0].beam_h,
+            "Slab t (m)": res.sections[0].slab_t,
+        })
 
         if score < best_score:
             best_score = score
@@ -1539,62 +1563,54 @@ def run_design(inp: BuildingInput) -> DesignResult:
 
         ok_drift = max_drift <= inp.drift_limit_ratio * 1.03
         ok_mass = min_mass >= inp.minimum_modal_mass_ratio
-
-        if ok_drift and ok_mass and drift_ratio_over >= 0.35:
+        ok_period = (period_ratio <= 1.00) if inp.enforce_period_limit else True
+        if ok_drift and ok_mass and ok_period:
             best = res
             break
 
-        if max_drift > inp.drift_limit_ratio:
-            growth = min(inp.growth_limit_per_iteration, drift_ratio_over ** 0.18)
-            wall_scale *= growth
-            col_scale *= min(inp.growth_limit_per_iteration, drift_ratio_over ** 0.12)
-            beam_scale *= min(inp.growth_limit_per_iteration, drift_ratio_over ** 0.10)
-            slab_scale *= min(1.06, drift_ratio_over ** 0.06)
-            out_scale *= min(1.20, drift_ratio_over ** 0.20)
-        elif drift_ratio_over < 0.35:
-            # Conservative research setting: do not automatically shrink sections
-            # unless the user explicitly permits optimization. This prevents
-            # misleading behavior where increasing redesign iterations makes
-            # the structure smaller only because drift is far below the limit.
+        if (inp.enforce_period_limit and period_ratio > 1.0) or max_drift > inp.drift_limit_ratio:
+            if inp.enforce_period_limit and period_ratio > 1.0:
+                pg = min(inp.growth_limit_per_iteration, target_period_ratio ** 0.32)
+                if inp.strengthen_core_for_period:
+                    wall_scale *= pg
+                    beam_scale *= min(1.14, target_period_ratio ** 0.14)
+                    slab_scale *= min(1.08, target_period_ratio ** 0.08)
+                if inp.strengthen_columns_for_period:
+                    col_scale *= min(1.16, target_period_ratio ** 0.22)
+                if inp.strengthen_outrigger_for_period and current_inp.outrigger_system != OutriggerSystem.NONE:
+                    out_scale *= min(1.12, target_period_ratio ** 0.12)
+            if max_drift > inp.drift_limit_ratio:
+                dg = min(inp.growth_limit_per_iteration, drift_ratio_over ** 0.20)
+                wall_scale *= dg
+                col_scale *= min(inp.growth_limit_per_iteration, drift_ratio_over ** 0.14)
+                beam_scale *= min(1.14, drift_ratio_over ** 0.11)
+                slab_scale *= min(1.08, drift_ratio_over ** 0.06)
+                out_scale *= min(1.12, drift_ratio_over ** 0.10)
+        elif drift_ratio_over < 0.35 and (not inp.enforce_period_limit or period_ratio < 0.80):
             if inp.allow_section_reduction:
                 wall_scale *= inp.reduction_limit_per_iteration
                 col_scale *= inp.reduction_limit_per_iteration
                 beam_scale *= max(inp.reduction_limit_per_iteration, 0.97)
                 slab_scale *= max(inp.reduction_limit_per_iteration, 0.98)
                 out_scale *= max(inp.reduction_limit_per_iteration, 0.96)
-            else:
-                wall_scale *= 1.0
-                col_scale *= 1.0
-                beam_scale *= 1.0
-                slab_scale *= 1.0
-                out_scale *= 1.0
 
-        wall_scale = float(np.clip(wall_scale, 0.40, 3.50))
-        col_scale = float(np.clip(col_scale, 0.40, 3.50))
-        beam_scale = float(np.clip(beam_scale, 0.50, 3.00))
-        slab_scale = float(np.clip(slab_scale, 0.75, 1.80))
-        out_scale = float(np.clip(out_scale, 0.40, 4.00))
+        wall_scale = float(np.clip(wall_scale, 0.40, 6.00))
+        col_scale = float(np.clip(col_scale, 0.40, 6.00))
+        beam_scale = float(np.clip(beam_scale, 0.50, 4.50))
+        slab_scale = float(np.clip(slab_scale, 0.75, 2.50))
+        out_scale = float(np.clip(out_scale, 0.40, 5.00))
 
     if best is None:
-        best = evaluate(replace(
-            inp,
-            design_wall_scale=wall_scale,
-            design_column_scale=col_scale,
-            design_beam_scale=beam_scale,
-            design_slab_scale=slab_scale,
-            design_outrigger_scale=out_scale,
-        ), 1.0, 1.0, 1.0)
+        best = evaluate(replace(inp, design_wall_scale=wall_scale, design_column_scale=col_scale, design_beam_scale=beam_scale, design_slab_scale=slab_scale, design_outrigger_scale=out_scale), 1.0, 1.0, 1.0)
 
     best.iteration_table = pd.DataFrame(logs)
     best.final_message = (
-        "ASCE-compliant modal RSA predesign completed. "
-        "Members were redesigned through wall, column, beam, slab, and outrigger scale factors. "
-        "Vertical members are enforced monotonic by height."
+        "Real preliminary design completed. Member dimensions were redesigned "
+        "against drift and ASCE upper-bound period criteria. The period is not "
+        "artificially calibrated; sections are increased until the design checks pass."
     )
     return best
 
-
-# ============================================================
 # 8. OUTPUT TABLES
 # ============================================================
 
@@ -2300,15 +2316,15 @@ def streamlit_input_panel() -> BuildingInput:
     c7, c8 = st.columns(2)
     with c7:
         min_wall_thickness = st.number_input("Min wall t (m)", 0.10, 2.0, 0.30)
-        max_wall_thickness = st.number_input("Max wall t (m)", 0.30, 4.0, 1.50)
+        max_wall_thickness = st.number_input("Max wall t (m)", 0.30, 4.0, 2.20)
         min_column_dim = st.number_input("Min column dim (m)", 0.20, 4.0, 0.70)
-        max_column_dim = st.number_input("Max column dim (m)", 0.50, 6.0, 2.50)
+        max_column_dim = st.number_input("Max column dim (m)", 0.50, 6.0, 3.50)
         min_slab_thickness = st.number_input("Min slab t (m)", 0.10, 1.0, 0.22)
-        max_slab_thickness = st.number_input("Max slab t (m)", 0.15, 1.2, 0.45)
+        max_slab_thickness = st.number_input("Max slab t (m)", 0.15, 1.2, 0.60)
     with c8:
-        wall_cracked_factor = st.number_input("Wall effective I factor", 0.05, 1.00, 0.35)
-        column_cracked_factor = st.number_input("Column effective I factor", 0.05, 1.00, 0.70)
-        side_wall_cracked_factor = st.number_input("Side wall effective I factor", 0.05, 1.00, 0.35)
+        wall_cracked_factor = st.number_input("Wall effective I factor", 0.03, 1.00, 0.20)
+        column_cracked_factor = st.number_input("Column effective I factor", 0.05, 1.00, 0.35)
+        side_wall_cracked_factor = st.number_input("Side wall effective I factor", 0.01, 1.00, 0.15)
         coupling_factor = st.number_input("Global coupling factor", 0.30, 2.00, 1.00)
         side_wall_ratio = st.number_input("Side wall length ratio", 0.0, 0.80, 0.20)
 
@@ -2342,8 +2358,8 @@ def streamlit_input_panel() -> BuildingInput:
         outrigger_chord_area_m2 = st.number_input("Truss chord area (m²)", 0.001, 2.0, 0.08, format="%.4f")
         outrigger_diagonal_area_m2 = st.number_input("Truss diagonal area (m²)", 0.001, 2.0, 0.04, format="%.4f")
         outrigger_connection_efficiency = st.number_input("Connection efficiency", 0.10, 1.00, 0.75)
-        outrigger_effectiveness_factor = st.number_input("Outrigger effectiveness factor", 0.05, 0.60, 0.25)
-        outrigger_lateral_participation = st.number_input("Outrigger lateral participation", 0.00, 0.25, 0.05)
+        outrigger_effectiveness_factor = st.number_input("Outrigger effectiveness factor", 0.00, 0.60, 0.10)
+        outrigger_lateral_participation = st.number_input("Outrigger lateral participation", 0.00, 0.25, 0.00)
         st.caption("Braced bays are real centered grid bays. The full EA/L is reduced before entering the global MDOF matrix.")
 
     levels = []
@@ -2396,10 +2412,14 @@ def streamlit_input_panel() -> BuildingInput:
         drift_limit_ratio = st.number_input("Drift limit ratio", 0.001, 0.050, 0.015, format="%.4f")
         minimum_modal_mass_ratio = st.number_input("Minimum modal mass ratio", 0.50, 0.99, 0.90)
     with c16:
-        max_iterations = st.number_input("Max redesign iterations", 1, 40, 12)
-        growth_limit = st.number_input("Growth limit per iteration", 1.01, 1.50, 1.12)
+        max_iterations = st.number_input("Max redesign iterations", 1, 60, 18)
+        growth_limit = st.number_input("Growth limit per iteration", 1.01, 1.50, 1.18)
         reduction_limit = st.number_input("Reduction limit per iteration", 0.70, 0.99, 0.96)
         allow_section_reduction = st.checkbox("Allow automatic section reduction", False)
+        enforce_period_limit = st.checkbox("Enforce ASCE period limit in redesign", True)
+        period_limit_multiplier = st.number_input("Period cap multiplier × CuTa", 0.50, 2.00, 1.00)
+        model_uncertainty_period_factor = st.number_input("Stick-to-ETABS period uncertainty factor", 1.00, 2.50, 1.35)
+        target_period_utilization = st.number_input("Target period utilization", 0.70, 1.00, 0.95)
 
     def _parse_bay_ids(txt: str) -> Tuple[int, ...]:
         vals: List[int] = []
@@ -2479,6 +2499,10 @@ def streamlit_input_panel() -> BuildingInput:
         outrigger_lateral_participation=float(outrigger_lateral_participation),
         drift_limit_ratio=float(drift_limit_ratio),
         minimum_modal_mass_ratio=float(minimum_modal_mass_ratio),
+        enforce_period_limit=bool(enforce_period_limit),
+        period_limit_multiplier=float(period_limit_multiplier),
+        model_uncertainty_period_factor=float(model_uncertainty_period_factor),
+        target_period_utilization=float(target_period_utilization),
         n_modes=int(n_modes),
         combination=CombinationMethod(combination),
         use_asce7_rsa=bool(use_asce7_rsa),
