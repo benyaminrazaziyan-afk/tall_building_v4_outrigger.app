@@ -1,5 +1,5 @@
 """
-Tall Building Outrigger Predesign Framework - Version 4.2
+Tall Building Outrigger Predesign Framework - Version 4.1
 =========================================================
 
 A preliminary structural engineering tool for comparing tall-building lateral
@@ -16,7 +16,7 @@ Core features
 - Perimeter walls are drawn and included in the lateral stiffness model.
 - Optional below-grade retaining-wall stiffness contribution for basement levels.
 
-Author: Benyamin Rezazian
+Author: BENYAMIN RAZAZIYAN
 Version: 4.1
 """
 
@@ -36,9 +36,9 @@ except Exception:
     scipy_eigh = None
 
 
-APP_VERSION = "4.3-spectrum-input-fixed"
+APP_VERSION = "4.4-reviewed-preliminary-framework"
 PROJECT_TITLE = "Tall Building Outrigger Predesign Framework"
-AUTHOR_NAME = "Benyamin Rezazian"
+AUTHOR_NAME = "BENYAMIN RAZAZIYAN"
 G = 9.81
 RHO_STEEL = 7850.0
 STEEL_E_MPA = 200000.0  # steel modulus for tubular/truss outrigger members
