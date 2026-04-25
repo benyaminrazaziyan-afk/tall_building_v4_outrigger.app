@@ -1,6 +1,6 @@
 """
-Tall Building Outrigger Predesign Framework - Version 4
-=======================================================
+Tall Building Outrigger Predesign Framework - Version 4.1
+=========================================================
 
 A preliminary structural engineering tool for comparing tall-building lateral
 systems with and without outrigger/braced-bay action.
@@ -13,9 +13,11 @@ Core features
 - Drift-controlled preliminary redesign loop.
 - Real braced-bay outrigger layout: selected bay panels are used consistently
   in the plan drawing, stiffness calculation, and global stiffness matrix.
+- Perimeter walls are drawn and included in the lateral stiffness model.
+- Optional below-grade retaining-wall stiffness contribution for basement levels.
 
 Author: Benyamin Rezazian
-Version: 4.0
+Version: 4.1
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ except Exception:
     scipy_eigh = None
 
 
-APP_VERSION = "4.0"
+APP_VERSION = "4.1"
 PROJECT_TITLE = "Tall Building Outrigger Predesign Framework"
 AUTHOR_NAME = "Benyamin Rezazian"
 G = 9.81
@@ -147,6 +149,12 @@ class BuildingInput:
     corner_column_factor: float = 1.30
     side_wall_ratio: float = 0.20
     perimeter_wall_ratio: float = 0.20
+
+    # Below-grade / basement retaining-wall contribution
+    include_basement_retaining_wall: bool = True
+    retaining_wall_thickness: float = 0.40
+    retaining_wall_cracked_factor: float = 0.45
+    basement_stiffness_participation: float = 0.65
 
     # Reinforcement ratios
     wall_rebar_ratio: float = 0.004
@@ -269,6 +277,8 @@ class StoryProperties:
     EI_y_Nm2: float   # stiffness for Y translation, bending about X
     Ktheta_out_x_Nm: float
     Ktheta_out_y_Nm: float
+    EI_basement_x_Nm2: float = 0.0
+    EI_basement_y_Nm2: float = 0.0
 
 
 @dataclass
@@ -584,6 +594,52 @@ def side_wall_inertia(inp: BuildingInput, sec: StorySection) -> Tuple[float, flo
     Iy_ywalls = 2 * (ly * t**3 / 12.0 + ly * t * (inp.plan_x / 2.0) ** 2)
 
     return inp.side_wall_cracked_factor * (Ix_xwalls + Ix_ywalls), inp.side_wall_cracked_factor * (Iy_xwalls + Iy_ywalls)
+
+
+def perimeter_wall_segments(inp: BuildingInput, sec: StorySection) -> List[Tuple[float, float, float, float]]:
+    """Return four above-grade perimeter wall strips as rectangles.
+
+    Format: (x0, y0, width, height). These wall strips are the same
+    side/perimeter walls considered in the stiffness calculation.
+    """
+    lx = max(sec.side_wall_length_x, 0.0)
+    ly = max(sec.side_wall_length_y, 0.0)
+    t = max(sec.side_wall_t, 0.0)
+    mx = inp.plan_x / 2.0
+    my = inp.plan_y / 2.0
+    return [
+        (mx - lx / 2.0, -t / 2.0, lx, t),
+        (mx - lx / 2.0, inp.plan_y - t / 2.0, lx, t),
+        (-t / 2.0, my - ly / 2.0, t, ly),
+        (inp.plan_x - t / 2.0, my - ly / 2.0, t, ly),
+    ]
+
+
+def basement_retaining_wall_inertia(inp: BuildingInput) -> Tuple[float, float]:
+    """Approximate below-grade retaining-wall stiffness contribution.
+
+    The superstructure model has a fixed base, so basement retaining walls are
+    represented as a controlled base-zone stiffness contribution rather than as
+    random upper-story walls. If basement levels are modeled explicitly in a
+    detailed FEM package, this approximation should be replaced by those wall
+    elements.
+    """
+    if not inp.include_basement_retaining_wall or inp.n_basement <= 0:
+        return 0.0, 0.0
+    t = float(np.clip(inp.retaining_wall_thickness, 0.20, 2.00))
+    Ix_box, Iy_box = rectangular_tube_inertia(inp.plan_x, inp.plan_y, t)
+    factor = inp.retaining_wall_cracked_factor * inp.basement_stiffness_participation
+    return factor * Ix_box, factor * Iy_box
+
+
+def basement_influence_factor(inp: BuildingInput, story: int) -> float:
+    """Taper retaining-wall stiffness over the first base-influence stories."""
+    if inp.n_basement <= 0:
+        return 0.0
+    influence_stories = max(1, min(inp.n_story, int(ceil(inp.n_basement * inp.basement_height / inp.story_height)) + 1))
+    if story > influence_stories:
+        return 0.0
+    return (influence_stories - story + 1) / influence_stories
 
 
 def grid_column_coordinates(inp: BuildingInput) -> List[Tuple[float, float, str]]:
@@ -917,10 +973,14 @@ def build_story_properties(inp: BuildingInput, sections: List[StorySection]) -> 
 
         Ix_side, Iy_side = side_wall_inertia(inp, sec)
         Ix_col, Iy_col = column_group_inertia(inp, sec)
+        Ix_ret, Iy_ret = basement_retaining_wall_inertia(inp)
+        basement_factor = basement_influence_factor(inp, sec.story)
 
         # X translation bends about Y. Y translation bends about X.
-        EI_x = E * (Iy_core + Iy_side + Iy_col) * inp.coupling_factor
-        EI_y = E * (Ix_core + Ix_side + Ix_col) * inp.coupling_factor
+        EI_basement_x = E * Iy_ret * basement_factor
+        EI_basement_y = E * Ix_ret * basement_factor
+        EI_x = E * (Iy_core + Iy_side + Iy_col) * inp.coupling_factor + EI_basement_x
+        EI_y = E * (Ix_core + Ix_side + Ix_col) * inp.coupling_factor + EI_basement_y
 
         mass, weight, concrete, steel = story_mass_and_quantities(inp, sec)
 
@@ -935,6 +995,8 @@ def build_story_properties(inp: BuildingInput, sections: List[StorySection]) -> 
                 EI_y_Nm2=EI_y,
                 Ktheta_out_x_Nm=outrigger_Ktheta(inp, sec, Direction.X),
                 Ktheta_out_y_Nm=outrigger_Ktheta(inp, sec, Direction.Y),
+                EI_basement_x_Nm2=EI_basement_x,
+                EI_basement_y_Nm2=EI_basement_y,
             )
         )
     return props
@@ -1580,6 +1642,8 @@ def stiffness_table(res: DesignResult) -> pd.DataFrame:
                 "Outrigger Ktheta Y (GN.m/rad)": prop.Ktheta_out_y_Nm / 1e9,
                 "Outrigger Klat X (MN/m)": outrigger_Klateral(res.input, sec, Direction.X) / 1e6,
                 "Outrigger Klat Y (MN/m)": outrigger_Klateral(res.input, sec, Direction.Y) / 1e6,
+                "Basement EI X contribution (GN.m²)": prop.EI_basement_x_Nm2 / 1e9,
+                "Basement EI Y contribution (GN.m²)": prop.EI_basement_y_Nm2 / 1e9,
                 "Mass (t)": prop.mass_kg / 1000,
                 "Concrete (m³)": prop.concrete_m3,
                 "Steel (kg)": prop.steel_kg,
@@ -1625,11 +1689,24 @@ def plot_plan(res: DesignResult, zone_choice: str):
                 bx, by = sec.column_interior_x, sec.column_interior_y
             ax.add_patch(plt.Rectangle((x - bx / 2, y - by / 2), bx, by, facecolor="white", edgecolor="black", linewidth=0.9))
 
+    # Perimeter/side walls: these are structural walls, not façade lines.
+    for x0, y0, w, h in perimeter_wall_segments(inp, sec):
+        ax.add_patch(plt.Rectangle((x0, y0), w, h, facecolor="0.12", edgecolor="black", linewidth=1.0, zorder=4))
+
+    # Below-grade retaining wall outline is displayed when basement levels exist.
+    if inp.include_basement_retaining_wall and inp.n_basement > 0:
+        t_ret = max(inp.retaining_wall_thickness, 0.05)
+        ax.add_patch(plt.Rectangle((-t_ret, -t_ret), inp.plan_x + 2*t_ret, inp.plan_y + 2*t_ret,
+                                   fill=False, edgecolor="0.20", linewidth=2.4, linestyle="--", zorder=3))
+        ax.text(inp.plan_x + 2, inp.plan_y * 0.78,
+                f"Basement retaining wall included\nLevels below 0: {inp.n_basement}\nt = {inp.retaining_wall_thickness:.2f} m",
+                fontsize=8.5, va="center")
+
     cx0 = (inp.plan_x - sec.core_x) / 2
     cy0 = (inp.plan_y - sec.core_y) / 2
     cx1 = cx0 + sec.core_x
     cy1 = cy0 + sec.core_y
-    ax.add_patch(plt.Rectangle((cx0, cy0), sec.core_x, sec.core_y, fill=False, edgecolor="black", linewidth=7.0))
+    ax.add_patch(plt.Rectangle((cx0, cy0), sec.core_x, sec.core_y, fill=False, edgecolor="black", linewidth=7.0, zorder=5))
 
     zone_stories = [s.story for s in res.sections if s.zone == sec.zone]
     outriggers_in_zone = [lev for lev in active_outrigger_levels(inp) if lev in zone_stories]
