@@ -144,9 +144,18 @@ class BuildingInput:
     reference_Ec: float = 36000.0
 
     # Effective stiffness factors
+    # Effective stiffness / cracked inertia factors.
+    # These factors affect BOTH analysis stiffness and the redesign sizing demand.
     wall_cracked_factor: float = 0.20
     column_cracked_factor: float = 0.35
     side_wall_cracked_factor: float = 0.15
+    beam_cracked_factor: float = 0.35
+    slab_cracked_factor: float = 0.25
+    reference_wall_cracked_factor: float = 0.20
+    reference_column_cracked_factor: float = 0.35
+    reference_side_wall_cracked_factor: float = 0.15
+    reference_beam_cracked_factor: float = 0.35
+    reference_slab_cracked_factor: float = 0.25
     coupling_factor: float = 1.00
 
     # Wall/column layout
@@ -200,7 +209,6 @@ class BuildingInput:
     enforce_period_limit: bool = True
     period_limit_multiplier: float = 1.00
     target_period_utilization: float = 0.95
-    model_uncertainty_period_factor: float = 1.35
     strengthen_core_for_period: bool = True
     strengthen_columns_for_period: bool = True
     strengthen_outrigger_for_period: bool = True
@@ -403,23 +411,47 @@ def initial_core_dimensions(inp: BuildingInput) -> Tuple[float, float, float, fl
 
 
 
+def cracked_sizing_factor(inp: BuildingInput, member: str) -> float:
+    """
+    Converts cracked-stiffness input into a section-size demand modifier.
+    If the effective inertia factor is reduced, the final proposed section must
+    increase. For rectangular members, I roughly varies with h^3; therefore the
+    size demand is scaled with (I_ref/I_eff)^(1/3).
+    """
+    member = member.lower().strip()
+    if member == "column":
+        ref, val, exp = inp.reference_column_cracked_factor, inp.column_cracked_factor, 1.0 / 3.0
+    elif member == "wall":
+        ref, val, exp = inp.reference_wall_cracked_factor, inp.wall_cracked_factor, 1.0 / 3.0
+    elif member == "side_wall":
+        ref, val, exp = inp.reference_side_wall_cracked_factor, inp.side_wall_cracked_factor, 1.0 / 3.0
+    elif member == "beam":
+        ref, val, exp = inp.reference_beam_cracked_factor, inp.beam_cracked_factor, 1.0 / 3.0
+    elif member == "slab":
+        ref, val, exp = inp.reference_slab_cracked_factor, inp.slab_cracked_factor, 0.25
+    else:
+        ref, val, exp = 1.0, 1.0, 1.0 / 3.0
+    return float(np.clip((max(ref, 1e-6) / max(val, 1e-6)) ** exp, 0.75, 2.25))
+
+
 def material_size_factor(inp: BuildingInput, member: str) -> float:
-    """Material-responsive size modifier for preliminary RC member dimensions."""
+    """Material- and cracked-stiffness-responsive size modifier."""
     fck = max(float(inp.fck), 12.0)
     Ec = max(float(inp.Ec), 12000.0)
     fck_ref = max(float(inp.reference_fck), 12.0)
     Ec_ref = max(float(inp.reference_Ec), 12000.0)
     member = member.lower().strip()
     exponents = {
-        "column": (0.45, 0.10, 0.72, 1.35),
-        "wall":   (0.28, 0.22, 0.76, 1.30),
-        "beam":   (0.20, 0.10, 0.82, 1.22),
-        "slab":   (0.14, 0.06, 0.88, 1.15),
+        "column": (0.45, 0.10, 0.72, 2.20),
+        "wall":   (0.28, 0.22, 0.76, 2.20),
+        "side_wall": (0.28, 0.22, 0.76, 2.20),
+        "beam":   (0.20, 0.10, 0.82, 1.80),
+        "slab":   (0.14, 0.06, 0.88, 1.55),
     }
     a_fck, a_ec, lower, upper = exponents.get(member, exponents["column"])
-    factor = (fck_ref / fck) ** a_fck * (Ec_ref / Ec) ** a_ec
-    return float(np.clip(factor, lower, upper))
-
+    strength_factor = (fck_ref / fck) ** a_fck * (Ec_ref / Ec) ** a_ec
+    stiffness_factor = cracked_sizing_factor(inp, member)
+    return float(np.clip(strength_factor * stiffness_factor, lower, upper))
 
 def material_diagnostics(inp: BuildingInput) -> pd.DataFrame:
     """Table of active fck/Ec modifiers used in member sizing."""
@@ -430,9 +462,10 @@ def material_diagnostics(inp: BuildingInput) -> pd.DataFrame:
             "Ec (MPa)": inp.Ec,
             "Reference fck (MPa)": inp.reference_fck,
             "Reference Ec (MPa)": inp.reference_Ec,
-            "Size modifier": material_size_factor(inp, m),
+            "Cracked stiffness modifier": cracked_sizing_factor(inp, m),
+            "Final size modifier": material_size_factor(inp, m),
         }
-        for m in ["column", "wall", "beam", "slab"]
+        for m in ["column", "wall", "side_wall", "beam", "slab"]
     ])
 
 
@@ -448,7 +481,9 @@ def wall_thickness(inp: BuildingInput, story: int, scale: float = 1.0) -> float:
 
 
 def side_wall_thickness(inp: BuildingInput, story: int, scale: float = 1.0) -> float:
-    t = 0.70 * wall_thickness(inp, story, scale)
+    h_ratio = 1.0 - (story - 1) / max(inp.n_story - 1, 1)
+    base = 0.70 * inp.height / 220.0
+    t = base * (0.55 + 0.45 * h_ratio) * material_size_factor(inp, "side_wall") * scale * inp.design_wall_scale
     return float(np.clip(t, inp.min_wall_thickness, inp.max_wall_thickness))
 
 
@@ -1291,7 +1326,7 @@ def period_limit_values(inp: BuildingInput, modal_T: float) -> Tuple[float, floa
     Ta = approximate_Ta(inp)
     CuTa = inp.asce7.Cu * Ta
     T_allow = inp.period_limit_multiplier * CuTa
-    T_design = modal_T * max(inp.model_uncertainty_period_factor, 1.0)
+    T_design = modal_T
     return Ta, CuTa, T_allow, T_design
 
 
@@ -1469,7 +1504,7 @@ def run_design(inp: BuildingInput) -> DesignResult:
     The code now designs the proposed sections against two independent checks:
     drift and ASCE upper-bound period. If the analytical design period is larger
     than CuTa, the code increases wall, column, beam/slab collector, and outrigger
-    scales and rebuilds the stiffness matrix. This is not artificial ETABS matching.
+    scales and rebuilds the stiffness matrix. This is not artificial period matching.
     """
     if not inp.auto_redesign:
         return evaluate(inp)
@@ -1528,8 +1563,8 @@ def run_design(inp: BuildingInput) -> DesignResult:
             "Outrigger lateral participation": current_inp.outrigger_lateral_participation,
             "T_modal X (s)": res.modal_x.periods_s[0],
             "T_modal Y (s)": res.modal_y.periods_s[0],
-            "T_design X = T*uncertainty (s)": T_design_x,
-            "T_design Y = T*uncertainty (s)": T_design_y,
+            "T_design X (s)": T_design_x,
+            "T_design Y (s)": T_design_y,
             "Ta reference (s)": res.rsa_x.Ta_s,
             "CuTa (s)": CuTa,
             "T_allow = factor*CuTa (s)": T_allow,
@@ -2051,7 +2086,7 @@ def build_report(res: DesignResult) -> str:
     lines.append("6. Engineering conclusion")
     lines.append("-" * 96)
     lines.append("This file is suitable for preliminary structural system comparison and thesis-level methodology discussion.")
-    lines.append("It is not a final code-design replacement for ETABS because 3D torsion, accidental eccentricity, P-Delta, diaphragm modeling, detailed member design, and load combinations are still required.")
+    lines.append("It is not a final code-design replacement for a full three-dimensional structural analysis model because torsion, accidental eccentricity, P-Delta, diaphragm modeling, detailed member design, and load combinations are still required.")
     return "\n".join(lines)
 
 
@@ -2325,6 +2360,8 @@ def streamlit_input_panel() -> BuildingInput:
         wall_cracked_factor = st.number_input("Wall effective I factor", 0.03, 1.00, 0.20)
         column_cracked_factor = st.number_input("Column effective I factor", 0.05, 1.00, 0.35)
         side_wall_cracked_factor = st.number_input("Side wall effective I factor", 0.01, 1.00, 0.15)
+        beam_cracked_factor = st.number_input("Beam effective I factor", 0.05, 1.00, 0.35)
+        slab_cracked_factor = st.number_input("Slab/diaphragm effective I factor", 0.05, 1.00, 0.25)
         coupling_factor = st.number_input("Global coupling factor", 0.30, 2.00, 1.00)
         side_wall_ratio = st.number_input("Side wall length ratio", 0.0, 0.80, 0.20)
 
@@ -2418,7 +2455,6 @@ def streamlit_input_panel() -> BuildingInput:
         allow_section_reduction = st.checkbox("Allow automatic section reduction", False)
         enforce_period_limit = st.checkbox("Enforce ASCE period limit in redesign", True)
         period_limit_multiplier = st.number_input("Period cap multiplier × CuTa", 0.50, 2.00, 1.00)
-        model_uncertainty_period_factor = st.number_input("Stick-to-ETABS period uncertainty factor", 1.00, 2.50, 1.35)
         target_period_utilization = st.number_input("Target period utilization", 0.70, 1.00, 0.95)
 
     def _parse_bay_ids(txt: str) -> Tuple[int, ...]:
@@ -2471,6 +2507,8 @@ def streamlit_input_panel() -> BuildingInput:
         wall_cracked_factor=float(wall_cracked_factor),
         column_cracked_factor=float(column_cracked_factor),
         side_wall_cracked_factor=float(side_wall_cracked_factor),
+        beam_cracked_factor=float(beam_cracked_factor),
+        slab_cracked_factor=float(slab_cracked_factor),
         coupling_factor=float(coupling_factor),
         lower_zone_wall_count=int(lower_zone_wall_count),
         middle_zone_wall_count=int(middle_zone_wall_count),
@@ -2501,7 +2539,6 @@ def streamlit_input_panel() -> BuildingInput:
         minimum_modal_mass_ratio=float(minimum_modal_mass_ratio),
         enforce_period_limit=bool(enforce_period_limit),
         period_limit_multiplier=float(period_limit_multiplier),
-        model_uncertainty_period_factor=float(model_uncertainty_period_factor),
         target_period_utilization=float(target_period_utilization),
         n_modes=int(n_modes),
         combination=CombinationMethod(combination),
