@@ -48,7 +48,7 @@ except Exception:
     scipy_eigh = None
 
 
-APP_VERSION = "v24.0-outrigger-count-and-real-braced-bay-layout"
+APP_VERSION = "v25.0-outrigger-span-stiffness-sum-method"
 G = 9.81
 RHO_STEEL = 7850.0
 STEEL_E_MPA = 200000.0  # steel modulus for tubular/truss outrigger members
@@ -701,20 +701,13 @@ def active_outrigger_levels(inp: BuildingInput) -> Tuple[int, ...]:
 
 def outrigger_Ktheta(inp: BuildingInput, sec: StorySection, direction: Direction) -> float:
     """
-    Real preliminary outrigger stiffness model.
+    Outrigger rotational stiffness by span summation.
 
-    Mechanical path used here:
-        core rotation -> outrigger diagonals/chords -> collector/belt beam ->
-        exterior braced columns -> axial couple resisting core rotation.
-
-    This is still a preliminary stick-model representation, but it is no longer
-    a decorative spring. The stiffness depends on:
-      1) actual number of braced spans,
-      2) brace axial EA/L,
-      3) collector/belt beam flexural stiffness,
-      4) exterior-column axial stiffness over the participating height,
-      5) lever arm from the core face to the perimeter column line,
-      6) connection/load-path efficiency.
+    User-required method:
+        1. Select only real braced bay panels between column grid lines.
+        2. Calculate stiffness of one brace from EA/L and projection factor.
+        3. Multiply by the number of braces in the selected braced spans.
+        4. Convert the transferred axial stiffness into core rotational restraint.
     """
     if inp.outrigger_system == OutriggerSystem.NONE:
         return 0.0
@@ -726,74 +719,104 @@ def outrigger_Ktheta(inp: BuildingInput, sec: StorySection, direction: Direction
     eta = max(min(outrigger_efficiency(inp.outrigger_system) * inp.outrigger_connection_efficiency, 1.0), 0.05)
 
     if direction == Direction.X:
-        # X lateral translation is resisted by an axial couple on east/west exterior column lines.
-        bay = max(inp.bay_x, 1e-9)
-        core_dim = sec.core_x
-        plan_dim = inp.plan_x
+        # X lateral response: selected braced panels are real bays along Y.
+        bay_width = max(inp.bay_y, 1e-9)
+        beam_span = max(inp.bay_y, 1e-9)
         bay_ids = active_braced_bays(inp, Direction.X)
-        n_bays = len(bay_ids)
-        n_lines = 2  # left and right sides of the core
-        exterior_col_area = sec.column_perimeter_x * sec.column_perimeter_y
-        corner_col_area = sec.column_corner_x * sec.column_corner_y
+        plan_dim = inp.plan_x
+        core_dim = sec.core_x
     else:
-        # Y lateral translation is resisted by an axial couple on north/south exterior column lines.
-        bay = max(inp.bay_y, 1e-9)
-        core_dim = sec.core_y
-        plan_dim = inp.plan_y
+        # Y lateral response: selected braced panels are real bays along X.
+        bay_width = max(inp.bay_x, 1e-9)
+        beam_span = max(inp.bay_x, 1e-9)
         bay_ids = active_braced_bays(inp, Direction.Y)
-        n_bays = len(bay_ids)
-        n_lines = 2
-        exterior_col_area = sec.column_perimeter_x * sec.column_perimeter_y
-        corner_col_area = sec.column_corner_x * sec.column_corner_y
+        plan_dim = inp.plan_y
+        core_dim = sec.core_y
 
-    if n_bays <= 0:
+    n_selected_bays = len(bay_ids)
+    if n_selected_bays <= 0:
         return 0.0
 
-    lever_arm = max((plan_dim - core_dim) / 2.0, bay)  # core face to exterior line, not full building width
-    story_h = max(inp.story_height, 1e-9)
-    out_depth = max(inp.outrigger_depth_m, story_h)    # vertical truss depth; at least one story high
-    diag_len = sqrt(lever_arm**2 + out_depth**2)
-    cos2 = (lever_arm / diag_len) ** 2
+    # Lever arm from core face to the exterior braced column line.
+    lever_arm = max((plan_dim - core_dim) / 2.0, 1e-9)
 
-    # Effective number of brace panels on both sides. Each braced bay normally has two diagonals.
-    n_panels = n_lines * n_bays
-    n_diagonals = 2.0 * n_panels
+    # Braced panel geometry. The brace is inside a real bay panel, not a random line.
+    story_h = max(inp.story_height, 1e-9)
+    brace_depth = max(inp.outrigger_depth_m, story_h)
+    L_brace = sqrt(bay_width**2 + brace_depth**2)
+    cos2 = (bay_width / L_brace) ** 2
+
+    # Each X-braced bay has two diagonals. The same selected panels exist on two opposite sides.
+    braces_per_bay_per_side = 2.0
+    side_count = 2.0
+    n_braces_total = braces_per_bay_per_side * side_count * n_selected_bays
 
     if inp.outrigger_system == OutriggerSystem.TUBULAR_BRACE:
-        A_diag = tube_area(inp.tubular_diameter_m * inp.design_outrigger_scale,
-                           inp.tubular_thickness_m * inp.design_outrigger_scale)
-        k_brace_axial = n_diagonals * E_steel * A_diag / diag_len * cos2
-        # tube chord/belt participation is smaller but not zero
-        k_chord_axial = 0.35 * n_panels * E_steel * A_diag / max(lever_arm, 1e-9)
+        A_brace = tube_area(inp.tubular_diameter_m * inp.design_outrigger_scale,
+                            inp.tubular_thickness_m * inp.design_outrigger_scale)
+        A_chord = 0.35 * A_brace
     else:
-        A_diag = inp.outrigger_diagonal_area_m2 * inp.design_outrigger_scale
+        A_brace = inp.outrigger_diagonal_area_m2 * inp.design_outrigger_scale
         A_chord = inp.outrigger_chord_area_m2 * inp.design_outrigger_scale
-        k_brace_axial = n_diagonals * E_steel * A_diag / diag_len * cos2
-        k_chord_axial = 2.0 * n_panels * E_steel * A_chord / max(lever_arm, 1e-9)
 
-    k_steel_path = k_brace_axial + k_chord_axial
+    # Main correction: total outrigger stiffness = stiffness of each brace times number of braces.
+    k_one_brace_projected = E_steel * A_brace / max(L_brace, 1e-9) * cos2
+    k_braces_total = n_braces_total * k_one_brace_projected
 
-    # Collector/belt beam limitation. A weak belt cannot deliver brace force to exterior columns.
-    I_beam = sec.beam_b * sec.beam_h**3 / 12.0
-    k_one_collector = 12.0 * E_conc * I_beam / max(bay**3, 1e-9)
-    k_collector = n_panels * k_one_collector
+    # Secondary chord/belt axial path.
+    k_one_chord = E_steel * A_chord / max(lever_arm, 1e-9)
+    k_chords_total = side_count * n_selected_bays * 2.0 * k_one_chord
+    k_outrigger_span_sum = k_braces_total + k_chords_total
 
-    # Exterior column axial participation over tributary height around outrigger.
-    # Use one story above + one story below for a preliminary local axial spring.
-    L_col_eff = max(2.0 * story_h, out_depth)
-    # include braced bay end columns; corners participate but are not all active in every bay
-    A_ext_total = n_panels * exterior_col_area + 0.50 * n_lines * corner_col_area
-    k_columns_axial = E_conc * A_ext_total / max(L_col_eff, 1e-9)
+    # Collector/belt beams and exterior columns cap the transferred stiffness.
+    I_belt = sec.beam_b * sec.beam_h**3 / 12.0
+    k_one_collector_span = 12.0 * E_conc * I_belt / max(beam_span**3, 1e-9)
+    k_collector_total = side_count * n_selected_bays * k_one_collector_span
 
-    # Load path springs are in series: steel outrigger, collector/belt, and exterior columns.
-    inv_k = 1.0 / max(k_steel_path, 1e-9) + 1.0 / max(k_collector, 1e-9) + 1.0 / max(k_columns_axial, 1e-9)
+    A_col = sec.column_perimeter_x * sec.column_perimeter_y
+    A_corner = sec.column_corner_x * sec.column_corner_y
+    n_exterior_columns = side_count * (n_selected_bays + 1.0)
+    A_columns_total = n_exterior_columns * A_col + 0.25 * side_count * A_corner
+    L_col_eff = max(2.0 * story_h, brace_depth)
+    k_columns_total = E_conc * A_columns_total / max(L_col_eff, 1e-9)
+
+    inv_k = (
+        1.0 / max(k_outrigger_span_sum, 1e-9)
+        + 1.0 / max(k_collector_total, 1e-9)
+        + 1.0 / max(k_columns_total, 1e-9)
+    )
     k_transfer = 1.0 / inv_k
 
-    # Convert axial transfer stiffness into rotational restraint at the core.
-    Ktheta = eta * k_transfer * lever_arm**2
-    return float(max(Ktheta, 0.0))
+    return float(max(eta * k_transfer * lever_arm**2, 0.0))
 
 
+def outrigger_span_stiffness_components(inp: BuildingInput, sec: StorySection, direction: Direction) -> Dict[str, float]:
+    """Diagnostic values for checking the span-summation outrigger method."""
+    if inp.outrigger_system == OutriggerSystem.NONE or sec.story not in active_outrigger_levels(inp):
+        return {"selected_bays": 0.0, "total_braces": 0.0, "k_one_brace_MN_per_m": 0.0,
+                "k_braces_total_MN_per_m": 0.0, "Ktheta_GNm_per_rad": 0.0}
+    if direction == Direction.X:
+        bay_width = max(inp.bay_y, 1e-9)
+        bay_ids = active_braced_bays(inp, Direction.X)
+    else:
+        bay_width = max(inp.bay_x, 1e-9)
+        bay_ids = active_braced_bays(inp, Direction.Y)
+    n_selected_bays = len(bay_ids)
+    brace_depth = max(inp.outrigger_depth_m, inp.story_height)
+    L_brace = sqrt(bay_width**2 + brace_depth**2)
+    cos2 = (bay_width / L_brace) ** 2
+    if inp.outrigger_system == OutriggerSystem.TUBULAR_BRACE:
+        A_brace = tube_area(inp.tubular_diameter_m * inp.design_outrigger_scale,
+                            inp.tubular_thickness_m * inp.design_outrigger_scale)
+    else:
+        A_brace = inp.outrigger_diagonal_area_m2 * inp.design_outrigger_scale
+    k_one = STEEL_E_MPA * 1e6 * A_brace / max(L_brace, 1e-9) * cos2
+    n_braces = 2.0 * 2.0 * n_selected_bays
+    return {"selected_bays": float(n_selected_bays),
+            "total_braces": float(n_braces),
+            "k_one_brace_MN_per_m": float(k_one / 1e6),
+            "k_braces_total_MN_per_m": float(n_braces * k_one / 1e6),
+            "Ktheta_GNm_per_rad": float(outrigger_Ktheta(inp, sec, direction) / 1e9)}
 def outrigger_Klateral(inp: BuildingInput, sec: StorySection, direction: Direction) -> float:
     """
     Equivalent lateral spring at the outrigger floor.
@@ -1842,33 +1865,34 @@ def outrigger_design_table(res: DesignResult) -> pd.DataFrame:
     if inp.outrigger_system == OutriggerSystem.NONE:
         return pd.DataFrame([{"Message": "No outrigger is selected."}])
 
-    for lev in inp.outrigger_story_levels:
+    for lev in active_outrigger_levels(inp):
         idx = min(max(int(lev), 1), inp.n_story) - 1
         sec = res.sections[idx]
         for direction in [Direction.X, Direction.Y]:
             plan_dim = inp.plan_x if direction == Direction.X else inp.plan_y
             core_dim = sec.core_x if direction == Direction.X else sec.core_y
-            bay = inp.bay_x if direction == Direction.X else inp.bay_y
-            n_spans = inp.braced_spans_x if direction == Direction.X else inp.braced_spans_y
-            lever_arm = max((plan_dim - core_dim) / 2.0, bay)
+            bay_width = inp.bay_y if direction == Direction.X else inp.bay_x
+            active_bays = active_braced_bays(inp, direction)
+            comp = outrigger_span_stiffness_components(inp, sec, direction)
+            lever_arm = max((plan_dim - core_dim) / 2.0, 1e-9)
             depth = max(inp.outrigger_depth_m, inp.story_height)
-            diag_len = sqrt(lever_arm**2 + depth**2)
-            A_tube = tube_area(inp.tubular_diameter_m * inp.design_outrigger_scale,
-                               inp.tubular_thickness_m * inp.design_outrigger_scale)
-            ktheta = outrigger_Ktheta(inp, sec, direction)
+            brace_len = sqrt(bay_width**2 + depth**2)
             klat = outrigger_Klateral(inp, sec, direction)
             rows.append({
                 "Story": lev,
                 "Direction": direction.value,
-                "Braced spans": int(n_spans),
-                "Braced panels both sides": int(2 * n_spans),
+                "Active bay IDs": list(active_bays),
+                "Selected braced bays": int(comp["selected_bays"]),
+                "Total diagonal braces": int(comp["total_braces"]),
+                "One brace projected stiffness (MN/m)": comp["k_one_brace_MN_per_m"],
+                "Sum of brace stiffnesses (MN/m)": comp["k_braces_total_MN_per_m"],
                 "Lever arm core-face to exterior (m)": lever_arm,
-                "Brace length (m)": diag_len,
-                "Tube area if tubular (m²)": A_tube,
+                "Brace panel width (m)": bay_width,
+                "Brace length (m)": brace_len,
                 "Collector beam b x h (m)": f"{sec.beam_b:.2f} x {sec.beam_h:.2f}",
-                "Ktheta added to MDOF (GN.m/rad)": ktheta / 1e9,
+                "Ktheta added to MDOF (GN.m/rad)": comp["Ktheta_GNm_per_rad"],
                 "Equivalent Klat added (MN/m)": klat / 1e6,
-                "Load path": "core rotation -> braces/chords -> belt collectors -> exterior columns",
+                "Method": "K_out = sum(EA/L*cos²θ) for braces in real braced spans",
             })
     return pd.DataFrame(rows)
 
